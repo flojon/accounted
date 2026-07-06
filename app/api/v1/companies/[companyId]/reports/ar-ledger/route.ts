@@ -1,13 +1,13 @@
 /**
  * GET /api/v1/companies/{companyId}/reports/ar-ledger
  *
- * Accounts receivable ledger (kundreskontra) — unpaid customer invoices
+ * Accounts receivable ledger (kundreskontra): unpaid customer invoices
  * grouped by customer with aging buckets.
  */
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
@@ -17,9 +17,9 @@ registerEndpoint({
   operation: 'reports.ar-ledger',
   method: 'GET',
   path: '/api/v1/companies/:companyId/reports/ar-ledger',
-  summary: 'AR ledger — unpaid customer invoices with aging.',
+  summary: 'AR ledger: unpaid customer invoices with aging.',
   description:
-    'Returns the customer-receivable ledger as of `as_of_date` (defaults to today). Each customer entry includes outstanding invoices grouped into aging buckets (0–30, 31–60, 61–90, 90+ days). Reconciles against BAS 1510.',
+    'Returns the customer-receivable ledger as of `as_of_date` (defaults to today). Each customer entry includes outstanding invoices grouped into aging buckets (0-30, 31-60, 61-90, 90+ days). Reconciles against BAS 1510.',
   useWhen:
     'Cash collection dashboards, dunning workflows, end-of-period reconciliation against the 1510 trial-balance figure.',
   doNotUseFor:
@@ -39,7 +39,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: z.unknown() },
+  response: { success: dataEnvelope(z.unknown()) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(

@@ -40,6 +40,12 @@ vi.mock('@/lib/bookkeeping/category-mapping', () => ({
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: vi.fn().mockResolvedValue({ id: 'je-123' }),
+  // Coherent with the mocked mapping above: 373.75 gross = 299 net + 74.75 moms.
+  buildTransactionEntryLines: vi.fn().mockReturnValue([
+    { account_number: '2641', debit_amount: 74.75, credit_amount: 0, line_description: 'Ingående moms 25%' },
+    { account_number: '6110', debit_amount: 299, credit_amount: 0, line_description: 'Kostnad' },
+    { account_number: '1930', debit_amount: 0, credit_amount: 373.75, line_description: 'Bank' },
+  ]),
 }))
 
 vi.mock('@/lib/events/bus', () => ({
@@ -107,6 +113,13 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
 
 vi.mock('@/lib/transactions/category-suggestions', () => ({
   getSuggestedCategories: vi.fn(),
+}))
+
+// The categorize tool runs the booking-time duplicate guard before staging.
+// These tests don't exercise that path, so stub it to "no duplicate": otherwise
+// its detection queries would consume the queued supabase mock results.
+vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
+  detectBookingDuplicate: vi.fn().mockResolvedValue(null),
 }))
 
 vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
@@ -195,7 +208,18 @@ describe('MCP Receipt Matcher', () => {
       })
     })
 
-    it('does not include _meta for tools without it', async () => {
+    it('does not include _meta for read-only tools that neither stage nor render UI', async () => {
+      const res = await handleMcpRequest(mcpRequest('tools/list'))
+      const result = await parseResult(res)
+
+      const listTool = result.tools.find(
+        (t: { name: string }) => t.name === 'gnubok_list_customers'
+      )
+      expect(listTool).toBeDefined()
+      expect(listTool._meta).toBeUndefined()
+    })
+
+    it('includes the derived staging contract in _meta for staging writes', async () => {
       const res = await handleMcpRequest(mcpRequest('tools/list'))
       const result = await parseResult(res)
 
@@ -203,7 +227,10 @@ describe('MCP Receipt Matcher', () => {
         (t: { name: string }) => t.name === 'gnubok_categorize_transaction'
       )
       expect(categorizeTool).toBeDefined()
-      expect(categorizeTool._meta).toBeUndefined()
+      expect(categorizeTool._meta).toMatchObject({
+        requires_approval: true,
+        approve_tool: 'gnubok_approve_pending_operation',
+      })
     })
   })
 
@@ -307,8 +334,8 @@ describe('MCP Receipt Matcher', () => {
         { data: tx, error: null },           // fetch transaction (preview)
         { data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null },
         { data: tx, error: null },            // fetch transaction for title
-        { data: null, error: null },          // resolvePeriodStatusForDate — company_settings
-        { data: null, error: null },          // resolvePeriodStatusForDate — fiscal_periods
+        { data: null, error: null },          // resolvePeriodStatusForDate: company_settings
+        { data: null, error: null },          // resolvePeriodStatusForDate: fiscal_periods
         { data: { id: 'op-1' }, error: null }, // insert into pending_operations
       ])
 
@@ -350,8 +377,8 @@ describe('MCP Receipt Matcher', () => {
         { data: tx, error: null },
         { data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null },
         { data: tx, error: null },            // fetch transaction for title
-        { data: null, error: null },          // resolvePeriodStatusForDate — company_settings
-        { data: null, error: null },          // resolvePeriodStatusForDate — fiscal_periods
+        { data: null, error: null },          // resolvePeriodStatusForDate: company_settings
+        { data: null, error: null },          // resolvePeriodStatusForDate: fiscal_periods
         { data: { id: 'op-1' }, error: null }, // insert into pending_operations
       ])
 

@@ -165,12 +165,12 @@ export default function BankingSettingsPanel() {
     }
   }
 
-  // Re-authorize an existing connection in place — no disconnect required.
+  // Re-authorize an existing connection in place: no disconnect required.
   // Posts to /connect with the existing connection_id so the server reuses the
   // same row (revoking the dead session, issuing fresh authorization), then
   // hands off to the bank's consent screen. The OAuth callback drives the row
   // back through account selection to active.
-  async function handleReconnect(connection: BankConnection) {
+  async function handleReconnect(connection: BankConnection, psuTypeOverride?: 'personal' | 'business') {
     if (connectingRef.current) return
     connectingRef.current = true
     setIsConnecting(true)
@@ -185,6 +185,9 @@ export default function BankingSettingsPanel() {
           connection_id: connection.id,
           aspsp_name: connection.bank_name,
           aspsp_country: country,
+          // Omitted → server reuses the connection's stored psu_type (falling
+          // back to entity_type). Set → switch account type in place.
+          ...(psuTypeOverride ? { psu_type: psuTypeOverride } : {}),
         }),
       })
 
@@ -367,7 +370,7 @@ export default function BankingSettingsPanel() {
         </div>
       )}
 
-      {/* Pending account selection — new connections waiting for the user to pick accounts */}
+      {/* Pending account selection: new connections waiting for the user to pick accounts */}
       {pendingSelectionConnections.length > 0 && (
         <Card className="border-warning/30">
           <CardHeader>
@@ -389,7 +392,7 @@ export default function BankingSettingsPanel() {
                     <div>
                       <p className="font-medium">{connection.bank_name}</p>
                       <p className="text-sm text-muted-foreground">
-                        {accountsList.length} konton tillgängliga — inga transaktioner synkas ännu
+                        {accountsList.length} konton tillgängliga: inga transaktioner synkas ännu
                       </p>
                     </div>
                   </div>
@@ -415,7 +418,7 @@ export default function BankingSettingsPanel() {
         </Card>
       )}
 
-      {/* Action required — expired/error connections */}
+      {/* Action required: expired/error connections */}
       {actionRequiredConnections.length > 0 && (
         <Card className="border-warning/30">
           <CardHeader>

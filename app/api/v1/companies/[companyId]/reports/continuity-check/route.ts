@@ -1,17 +1,17 @@
 /**
  * GET /api/v1/companies/{companyId}/reports/continuity-check
  *
- * IB/UB continuity check — verifies that the period's opening balances
+ * IB/UB continuity check: verifies that the period's opening balances
  * match the previous period's closing balances per account. The legal
  * basis is the general löpande bokföring obligation in BFL 5 kap +
  * BFNAR 2013:2 systemdokumentation/behandlingshistorik, AND the SIE4
  * spec's core invariant that #IB(year N) must equal #UB(year N-1).
- * (Not BFL 5 kap 7 § — that section covers rättelse, a separate rule.)
+ * (Not BFL 5 kap 7 §: that section covers rättelse, a separate rule.)
  */
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { loadPeriodFromQuery, safeGenerate } from '@/lib/api/v1/report-period'
 import { validateBalanceContinuity } from '@/lib/reports/continuity-check'
@@ -20,7 +20,7 @@ registerEndpoint({
   operation: 'reports.continuity-check',
   method: 'GET',
   path: '/api/v1/companies/:companyId/reports/continuity-check',
-  summary: 'IB/UB continuity check — opening balances match prior closing.',
+  summary: 'IB/UB continuity check: opening balances match prior closing.',
   description:
     'Validates that the target period\'s opening balances (IB) equal the prior period\'s closing balances (UB). The requirement derives from BFL 5 kap (löpande bokföring), BFNAR 2013:2 (systemdokumentation/behandlingshistorik), and the SIE4 spec\'s core invariant that #IB(year N) must equal #UB(year N-1). Returns per-account discrepancies so an operator can rectify them before period close.',
   useWhen:
@@ -42,7 +42,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: z.unknown() },
+  response: { success: dataEnvelope(z.unknown()) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(

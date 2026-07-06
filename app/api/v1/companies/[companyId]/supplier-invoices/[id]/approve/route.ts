@@ -2,7 +2,7 @@
  * POST /api/v1/companies/{companyId}/supplier-invoices/{id}/approve
  *
  * Transitions a `registered` supplier invoice to `approved`. No journal entry
- * is involved in this transition — the registration JE has already been posted
+ * is involved in this transition: the registration JE has already been posted
  * (under accrual) or is deferred to :mark-paid (under cash). Idempotent
  * (mandatory Idempotency-Key). Dry-runnable.
  *
@@ -14,7 +14,7 @@
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { eventBus } from '@/lib/events'
@@ -36,7 +36,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/supplier-invoices/:id/approve',
   summary: 'Approve a registered supplier invoice.',
   description:
-    'Flips a supplier invoice from `registered` to `approved`. No journal entry is posted here — the registration JE was already booked at :create under accrual, or is deferred to :mark-paid under cash. Idempotent. Dry-runnable.',
+    'Flips a supplier invoice from `registered` to `approved`. No journal entry is posted here: the registration JE was already booked at :create under accrual, or is deferred to :mark-paid under cash. Idempotent. Dry-runnable.',
   useWhen:
     'A registered SI has been reviewed and you want to mark it ready for payment. Many AP workflows gate :mark-paid behind an explicit approval step.',
   doNotUseFor:
@@ -56,7 +56,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: true,
-  response: { success: SupplierInvoiceApproved },
+  response: { success: dataEnvelope(SupplierInvoiceApproved) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(

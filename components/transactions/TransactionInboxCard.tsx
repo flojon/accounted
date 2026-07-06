@@ -20,10 +20,12 @@ import {
   AlertCircle,
   ArrowUpRight,
   ArrowDownRight,
+  EyeOff,
   FileSearch,
   FileText,
   Link2,
   Loader2,
+  MessageCircle,
   MoreHorizontal,
   Paperclip,
   Pencil,
@@ -39,12 +41,13 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 
-// True when the AI tier is active — gates user-facing strings that promise
+// True when the AI tier is active: gates user-facing strings that promise
 // AI behavior. On the free build (document-extraction disabled) we keep the
 // upload functional but drop the "AI:n läser dokumentet" promise.
 const HAS_AI_EXTRACTION = ENABLED_EXTENSION_IDS.has('document-extraction')
 import { TransactionAttachmentIndicator } from './TransactionAttachmentIndicator'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
 import type { TransactionWithInvoice, CategorizeHandler } from './transaction-types'
 
 interface TransactionInboxCardProps {
@@ -59,20 +62,22 @@ interface TransactionInboxCardProps {
   onCategorize: CategorizeHandler
   /** Confirm an auto-detected invoice match (1-click shortcut). */
   onOpenMatchDialog: (transaction: TransactionWithInvoice) => void
-  /** Open the manual picker — routes to customer or supplier picker by amount sign. */
+  /** Open the manual picker: routes to customer or supplier picker by amount sign. */
   onOpenMatchInvoicePicker: (transaction: TransactionWithInvoice) => void
-  /** Open the split-payment allocator (1 tx → N invoices) — same direction
+  /** Open the split-payment allocator (1 tx → N invoices): same direction
    *  detection as the single-pick picker. Optional so legacy callers stay
    *  source-compatible. */
   onOpenSplitMatch?: (transaction: TransactionWithInvoice) => void
-  /** Open the existing-verifikat matcher — link the bank tx to an already-booked
+  /** Open the existing-verifikat matcher: link the bank tx to an already-booked
    *  voucher (salary, Fortnox import, manual entry) with no new bokföring. */
   onOpenMatchVoucher?: (transaction: TransactionWithInvoice) => void
-  /** Open the attach-underlag dialog — pin an inbox document or a fresh upload
+  /** Open the attach-underlag dialog: pin an inbox document or a fresh upload
    *  to the transaction (the tx→doc mirror of the Documents view's matcher). */
   onOpenAttachDocument?: (transaction: TransactionWithInvoice) => void
   onOpenCategoryDialog: (transaction: TransactionWithInvoice) => void
   onDelete?: (id: string) => void
+  /** Mark the transaction as ignored so it leaves the inbox without a journal entry. */
+  onIgnore?: (transaction: TransactionWithInvoice) => void
   /** Open the edit-title dialog. Only wired for editable (unbooked/unmatched) rows. */
   onEditTitle?: (transaction: TransactionWithInvoice) => void
   onToggleSelect: (id: string) => void
@@ -92,18 +97,24 @@ export default function TransactionInboxCard({
   onOpenAttachDocument,
   onOpenCategoryDialog,
   onDelete,
+  onIgnore,
   onEditTitle,
   onToggleSelect,
   onAnimationComplete,
 }: TransactionInboxCardProps) {
   const t = useTranslations('tx_inbox_card')
-  // Attaching underlag is a write — hide the affordance from viewers so they
+  // Attaching underlag is a write: hide the affordance from viewers so they
   // don't dead-end on a 403 (mirrors the gate in TransactionHistoryList).
   const { canWrite } = useCanWrite()
+  // The transaction-side entry point to the assistant ("Lena"). openAgentSheet
+  // hands this specific bank line to the transaction.categorization intent:
+  // the mirror of "Fråga assistenten" in Dokumentinkorgen, so the user can
+  // start a booking with the agent from the inbox they actually live in.
+  const { openAgentSheet, identity } = useAgentSheet()
   const isProcessing = processingId === transaction.id
   const isDisabled = processingId !== null && processingId !== transaction.id
   const isIncome = transaction.amount > 0
-  // Optimistic override — flips the indicator to "attached" as soon as the
+  // Optimistic override: flips the indicator to "attached" as soon as the
   // upload POST succeeds, without waiting for the parent to refetch. The
   // next parent refresh will sync; in the meantime the user sees the
   // correct visual state immediately. Same hook handles agent-chat uploads
@@ -135,14 +146,20 @@ export default function TransactionInboxCard({
     !!transaction.potential_supplier_invoice && !transaction.supplier_invoice_id
   const isUncategorized = transaction.is_business === null && !transaction.journal_entry_id
   const showCheckbox = isBatchMode && isUncategorized
-  // Unbooked rows are still actionable (match, split, edit, categorize) — that
+  // Unbooked rows are still actionable (match, split, edit, categorize): that
   // includes imported bank rows, which are the whole point of the inbox.
   const isUnbooked = !transaction.journal_entry_id
+  // "Fråga [namn]" hands the row to the assistant for categorization/booking.
+  // Only on unbooked rows (nothing to categorize once it's a verifikat) and
+  // only after the user has built their agent in /onboarding/agent
+  // (identity.isVerified): same gate as the FAB / AgentSparkleButton.
+  const assistantName = identity.displayName?.trim() || 'min assistent'
+  const showAskAssistant = isUnbooked && identity.isVerified
   // ...but only rows the USER created in the app may be deleted. Imported rows
-  // (bank sync / CSV) are ignore-only — mirrors the server guard in
+  // (bank sync / CSV) are ignore-only: mirrors the server guard in
   // DELETE /api/transactions/[id]. See lib/transactions/origin.ts.
   const canDelete = isUnbooked && !isImportedTransaction(transaction)
-  // Title is editable only on a mutable staging row — not booked and not
+  // Title is editable only on a mutable staging row: not booked and not
   // confirmed-matched. Mirrors the server-side gate in PATCH /api/transactions/[id].
   const isTitleEditable =
     !transaction.journal_entry_id && !transaction.invoice_id && !transaction.supplier_invoice_id
@@ -214,7 +231,7 @@ export default function TransactionInboxCard({
   })()
 
   // Manual invoice-match affordance. Hidden once an auto-detected match is
-  // already shown as the primary button — having both makes the row noisy.
+  // already shown as the primary button: having both makes the row noisy.
   const showInvoiceMatchButton =
     isUnbooked && !hasInvoiceMatch && !hasSupplierInvoiceMatch
 
@@ -228,19 +245,20 @@ export default function TransactionInboxCard({
 
   // Secondary row actions are collapsed into a single ⋯ overflow menu to keep
   // the inbox row uncluttered. Bokför + the invoice-match button stay inline.
-  // "Matcha mot befintlig verifikation" — link to an already-booked voucher.
+  // "Matcha mot befintlig verifikation": link to an already-booked voucher.
   // Available on any unbooked row (income or expense), independent of whether an
   // invoice match was auto-detected: the user may want to point the bank line at
   // an existing salary/Fortnox/manual voucher instead of confirming a payment.
   const showMatchVoucherItem = isUnbooked && !!onOpenMatchVoucher
-  // "Matcha mot underlag" — pin an inbox doc / fresh upload to the tx. The
+  // "Matcha mot underlag": pin an inbox doc / fresh upload to the tx. The
   // tx→doc mirror of the Documents view's "Matcha mot transaktion".
   const showAttachDocumentItem = isUnbooked && canWrite && !!onOpenAttachDocument
   const showSplitItem = showInvoiceMatchButton && !!onOpenSplitMatch
   const showEditItem = isTitleEditable && !!onEditTitle
+  const showIgnoreItem = isUnbooked && isImportedTransaction(transaction) && !!onIgnore
   const showDeleteItem = canDelete && !!onDelete
   const showOverflowMenu =
-    showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showDeleteItem
+    showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem || showIgnoreItem || showDeleteItem
 
   return (
     <motion.div
@@ -321,13 +339,35 @@ export default function TransactionInboxCard({
                     <Link2 className="h-4 w-4" />
                   </Button>
                 )}
-                {/* The Paperclip indicator next to the description
-                    (TransactionAttachmentIndicator) is the single click
-                    target for opening the underlag. We deliberately don't
-                    duplicate that with a second icon in the trailing slot.
-                    Per-transaction agent help has moved to Dokumentinkorgen:
-                    match the underlag to the transaction and ask from there,
-                    where the receipt/invoice is in view. */}
+                {/* "Fråga [namn]": hand this bank line to the assistant for
+                    categorization/booking. The transaction-side entry point to
+                    the agent, mirroring "Fråga assistenten" in Dokumentinkorgen.
+                    The intent reads any linked underlag automatically, so it
+                    works whether or not the row already has a receipt attached.
+                    Icon-only ghost so it sits quietly in the row's action
+                    group. (The Paperclip indicator next to the description
+                    stays the single click target for opening the underlag:
+                    we don't duplicate that here.) */}
+                {showAskAssistant && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 text-muted-foreground hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      openAgentSheet({
+                        intentId: 'transaction.categorization',
+                        intentArgs: { transaction_id: transaction.id },
+                        contextRef: `transaction:${transaction.id}`,
+                      })
+                    }}
+                    aria-label={`Fråga ${assistantName}`}
+                    title={`Fråga ${assistantName}`}
+                    disabled={isProcessing || isDisabled}
+                  >
+                    <MessageCircle className="h-4 w-4" />
+                  </Button>
+                )}
                 {/* Secondary actions (split, edit, delete) collapse into a ⋯
                     overflow menu so the row stays uncluttered. */}
                 {showOverflowMenu && (
@@ -390,20 +430,31 @@ export default function TransactionInboxCard({
                           {t('edit_title_aria')}
                         </DropdownMenuItem>
                       )}
+                      {(showIgnoreItem || showDeleteItem) && (showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem) && (
+                        <DropdownMenuSeparator />
+                      )}
+                      {showIgnoreItem && (
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onIgnore!(transaction)
+                          }}
+                        >
+                          <EyeOff className="h-4 w-4" />
+                          {t('ignore_btn')}
+                        </DropdownMenuItem>
+                      )}
                       {showDeleteItem && (
-                        <>
-                          {(showMatchVoucherItem || showAttachDocumentItem || showSplitItem || showEditItem) && <DropdownMenuSeparator />}
-                          <DropdownMenuItem
-                            className="text-destructive focus:text-destructive"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              onDelete!(transaction.id)
-                            }}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                            {t('delete_aria')}
-                          </DropdownMenuItem>
-                        </>
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onDelete!(transaction.id)
+                          }}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          {t('delete_aria')}
+                        </DropdownMenuItem>
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -422,13 +473,12 @@ export default function TransactionInboxCard({
           {transaction.title_edited_at && (
             <>
               <DataListMetaSeparator />
-              <Badge
-                variant="secondary"
-                className="h-4 px-1.5 py-0 text-[10px]"
+              <span
+                className="text-muted-foreground"
                 title={originalName ? t('original_name_tooltip', { name: originalName }) : undefined}
               >
                 {t('edited_badge')}
-              </Badge>
+              </span>
             </>
           )}
           {skvCounterpartDate && (
@@ -441,7 +491,7 @@ export default function TransactionInboxCard({
             </>
           )}
         </DataListMeta>
-        {/* Extraction status — visible only while AI is reading a freshly
+        {/* Extraction status: visible only while AI is reading a freshly
             attached document, or briefly if reading failed. */}
         {HAS_AI_EXTRACTION &&
           !isBatchMode &&

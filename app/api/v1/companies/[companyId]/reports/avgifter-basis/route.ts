@@ -1,13 +1,13 @@
 /**
  * GET /api/v1/companies/{companyId}/reports/avgifter-basis
  *
- * Annual arbetsgivaravgifter basis per employee — feeds the AGI HU
+ * Annual arbetsgivaravgifter basis per employee: feeds the AGI HU
  * verification.
  */
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
@@ -19,7 +19,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/reports/avgifter-basis',
   summary: 'Annual arbetsgivaravgifter basis per employee.',
   description:
-    'Returns the annual avgifter basis per employee for `year`, summed across booked salary runs. Each row shows the basis, applied rate, and computed avgifter amount — useful for reconciling against monthly AGI filings (HU sum across the year).',
+    'Returns the annual avgifter basis per employee for `year`, summed across booked salary runs. Each row shows the basis, applied rate, and computed avgifter amount: useful for reconciling against monthly AGI filings (HU sum across the year).',
   useWhen:
     'Annual reconciliation between the AGI declarations and the bookkeeping (BAS 7510). Year-end audit prep.',
   doNotUseFor:
@@ -39,7 +39,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: z.unknown() },
+  response: { success: dataEnvelope(z.unknown()) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(

@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { cookies } from 'next/headers'
+import type { EntityType } from '@/types'
 
 const COMPANY_COOKIE = 'gnubok-company-id'
 
@@ -36,7 +37,7 @@ export async function getActiveCompanyId(
   supabase: SupabaseClient,
   userId: string
 ): Promise<string | null> {
-  // 1. user_preferences — authoritative
+  // 1. user_preferences: authoritative
   const { data: prefs } = await supabase
     .from('user_preferences')
     .select('active_company_id')
@@ -68,6 +69,35 @@ export async function getActiveCompanyId(
     .maybeSingle()
 
   return firstCompany?.company_id ?? null
+}
+
+/**
+ * Resolve a company's effective entity type.
+ *
+ * `company_settings.entity_type` is the read-primary source (what the user
+ * edits in settings and what the sidebar reads), with the canonical
+ * `companies.entity_type` as the fallback: mirroring app/api/settings and the
+ * report engines. Returns null only if the company can't be found.
+ */
+export async function getCompanyEntityType(
+  supabase: SupabaseClient,
+  companyId: string
+): Promise<EntityType | null> {
+  const { data: settings } = await supabase
+    .from('company_settings')
+    .select('entity_type')
+    .eq('company_id', companyId)
+    .maybeSingle()
+
+  if (settings?.entity_type) return settings.entity_type as EntityType
+
+  const { data: company } = await supabase
+    .from('companies')
+    .select('entity_type')
+    .eq('id', companyId)
+    .maybeSingle()
+
+  return (company?.entity_type as EntityType | undefined) ?? null
 }
 
 /**
@@ -123,7 +153,7 @@ export async function setActiveCompany(
     throw new CompanyContextError('User is not a member of this company', 'not_member')
   }
 
-  // Update user_preferences — this is the authoritative value RLS reads.
+  // Update user_preferences: this is the authoritative value RLS reads.
   // The write MUST be verified: an UPDATE filtered out by RLS affects zero
   // rows without raising an error, which previously made failed switches
   // look successful while middleware kept resolving the old company (#701).
@@ -151,7 +181,7 @@ export async function setActiveCompany(
     )
   }
 
-  // Refresh the cookie as a compat hint — only after the DB write is
+  // Refresh the cookie as a compat hint: only after the DB write is
   // confirmed, so the cookie can never diverge from user_preferences.
   const cookieStore = await cookies()
   cookieStore.set(COMPANY_COOKIE, companyId, {

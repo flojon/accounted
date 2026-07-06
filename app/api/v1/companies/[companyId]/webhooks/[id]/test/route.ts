@@ -1,5 +1,5 @@
 /**
- * /api/v1/companies/{companyId}/webhooks/{id}/test — POST :test verb.
+ * /api/v1/companies/{companyId}/webhooks/{id}/test: POST :test verb.
  *
  * Enqueues a synthetic `webhook.test` delivery against the configured
  * receiver. The dispatcher cron picks it up at next-minute boundary
@@ -10,7 +10,7 @@
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 
@@ -28,11 +28,11 @@ registerEndpoint({
   description:
     'Enqueues a webhook.test delivery against the configured receiver. The dispatcher delivers it on the next per-minute cron tick. Use the returned webhook_delivery_id to poll GET /webhooks/{id}/deliveries for the outcome.',
   useWhen:
-    'After creating or modifying a webhook, before relying on it in production — to validate that the receiver is reachable and that signature verification works on the receiver side.',
+    'After creating or modifying a webhook, before relying on it in production: to validate that the receiver is reachable and that signature verification works on the receiver side.',
   doNotUseFor:
     'Smoke-testing the dispatcher itself (use a real event). Replaying a failed delivery (use POST /webhook-deliveries/{id}/retry).',
   pitfalls: [
-    'Test deliveries follow the same retry policy as real events — a 500 from your receiver will retry 7 times over ~72h. Use a 2xx ack-only handler if you want a clean signal.',
+    'Test deliveries follow the same retry policy as real events: a 500 from your receiver will retry 7 times over ~72h. Use a 2xx ack-only handler if you want a clean signal.',
   ],
   example: {
     response: {
@@ -49,10 +49,10 @@ registerEndpoint({
   reversible: false,
   dryRunSupported: false,
   response: {
-    success: z.object({
+    success: dataEnvelope(z.object({
       webhook_delivery_id: z.string().uuid(),
       status: z.literal('pending'),
-    }),
+    })),
   },
 })
 
@@ -77,7 +77,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     if (!w.active || w.disabled_at) {
       return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
         requestId: ctx.requestId,
-        details: { field: 'active', message: 'Webhook is disabled — re-enable before sending a test event.' },
+        details: { field: 'active', message: 'Webhook is disabled: re-enable before sending a test event.' },
       })
     }
 

@@ -2,11 +2,11 @@
  * GET /api/v1/companies/{companyId}/fiscal-periods
  *
  * List fiscal periods (räkenskapsår) for the company. Ordered newest first.
- * Read-only in v1 — period creation, locking and closing land in Phase 4.
+ * Read-only in v1: period creation, locking and closing land in Phase 4.
  */
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse } from '@/lib/api/v1/errors'
 
@@ -25,7 +25,7 @@ const FiscalPeriod = z.object({
   exceeds_18_months: z.boolean(),
 })
 
-const FiscalPeriodsResponse = z.object({ fiscal_periods: z.array(FiscalPeriod) })
+const FiscalPeriodsResponse = dataEnvelope(z.object({ fiscal_periods: z.array(FiscalPeriod) }))
 
 const FISCAL_PERIOD_COLUMNS =
   'id, name, period_start, period_end, is_closed, closed_at, locked_at, ' +
@@ -41,24 +41,26 @@ registerEndpoint({
   useWhen:
     'You need to find the active period before booking, build a year-selector UI, or audit the period-lock history.',
   doNotUseFor:
-    'Creating, locking, or closing periods — those land in Phase 4 (`POST /fiscal-periods/{id}/lock`, `:close`, `:year-end`). Use the dashboard or wait for Phase 4.',
+    'Creating, locking, or closing periods: those land in Phase 4 (`POST /fiscal-periods/{id}/lock`, `:close`, `:year-end`). Use the dashboard or wait for Phase 4.',
   pitfalls: [
     'previous_period_id chains the bokslut continuity (BFNAR 2013:2). A null value on a non-first period is a data-quality red flag.',
-    'A period can be locked but not closed (löpande bokföring of the new year while bokslut work continues on the prior year — see BFL 5 kap 2 § for the löpande bokföring deadline).',
+    'A period can be locked but not closed (löpande bokföring of the new year while bokslut work continues on the prior year: see BFL 5 kap 2 § for the löpande bokföring deadline).',
     'BFL 3 kap caps a single fiscal period at 18 months. First-year exceptions are allowed.',
   ],
   example: {
     response: {
-      data: [
-        {
-          id: 'fp_2026',
-          name: 'Räkenskapsår 2026',
-          period_start: '2026-01-01',
-          period_end: '2026-12-31',
-          is_closed: false,
-          locked_at: null,
-        },
-      ],
+      data: {
+        fiscal_periods: [
+          {
+            id: 'fp_2026',
+            name: 'Räkenskapsår 2026',
+            period_start: '2026-01-01',
+            period_end: '2026-12-31',
+            is_closed: false,
+            locked_at: null,
+          },
+        ],
+      },
       meta: { request_id: 'req_…', api_version: '2026-05-12' },
     },
   },
@@ -72,14 +74,14 @@ registerEndpoint({
 
 /**
  * BFL 3 kap 1 § caps a räkenskapsår at 18 calendar months. "Calendar months"
- * matters here: 18 months can span 540–549 days depending on which 31-day
+ * matters here: 18 months can span 540-549 days depending on which 31-day
  * months and leap days fall in the window, so a fixed day count is either
  * too generous (false negatives) or too strict (false positives near month
- * boundaries). Use proper calendar arithmetic — the period end's anchor day
+ * boundaries). Use proper calendar arithmetic: the period end's anchor day
  * 18 months after the period start.
  */
 function exceedsEighteenMonths(periodStart: string, periodEnd: string): boolean {
-  // ISO date strings — UTC parse to avoid host-tz shifts.
+  // ISO date strings: UTC parse to avoid host-tz shifts.
   const start = new Date(periodStart + 'T00:00:00Z')
   const end = new Date(periodEnd + 'T00:00:00Z')
   const startY = start.getUTCFullYear()

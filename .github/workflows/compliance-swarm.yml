@@ -1,4 +1,4 @@
-name: compliance — full swarm
+name: "compliance: full swarm"
 
 # Full hybrid audit: deterministic scanners + LLM-driven deep_audit checks
 # (RoPA drift, AGPL §13 evaluation, IDOR/access-control reasoning, ISMS clause
@@ -40,7 +40,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

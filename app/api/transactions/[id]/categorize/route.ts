@@ -5,7 +5,7 @@ import { ensureInitialized } from '@/lib/init'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, buildMappingResultFromTemplate, validateTemplateForEntity } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { detectBookedDuplicateTransaction } from '@/lib/transactions/booking-duplicate-detection'
+import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { upsertCounterpartyTemplate, buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
@@ -153,7 +153,7 @@ export const POST = withRouteContext(
     // bound to the reviewed sibling. Mirrors the match-invoice soft-duplicate
     // guard. Runs before any categorization work so the user resolves it first.
     try {
-      const candidate = await detectBookedDuplicateTransaction(supabase, companyId, {
+      const candidate = await detectBookingDuplicate(supabase, companyId, {
         id,
         date: transaction.date,
         amount: transaction.amount,
@@ -166,12 +166,24 @@ export const POST = withRouteContext(
             details: { candidate },
           })
         }
-      } else if (!candidate || candidate.transaction_id !== body.expected_duplicate_transaction_id) {
+      } else if (
+        // force=true is bound to the reviewed candidate. A sibling-transaction
+        // candidate carries a transaction_id; a ledger-only voucher candidate
+        // does not, so both are bound by journal_entry_id. Re-detect and refuse
+        // the bypass unless it still matches, so a guessed id can't wave it away.
+        !candidate ||
+        !(
+          (candidate.journal_entry_id && candidate.journal_entry_id === body.expected_duplicate_journal_entry_id) ||
+          (candidate.transaction_id && candidate.transaction_id === body.expected_duplicate_transaction_id)
+        )
+      ) {
         return errorResponseFromCode('TRANSACTION_BOOK_FORCE_CANDIDATE_MISMATCH', txLog, {
           requestId,
           details: {
             expected_duplicate_transaction_id: body.expected_duplicate_transaction_id ?? null,
+            expected_duplicate_journal_entry_id: body.expected_duplicate_journal_entry_id ?? null,
             detected_transaction_id: candidate?.transaction_id ?? null,
+            detected_journal_entry_id: candidate?.journal_entry_id ?? null,
           },
         })
       } else {
@@ -180,8 +192,7 @@ export const POST = withRouteContext(
           requestId,
           dismissedTransactionId: candidate.transaction_id,
         })
-        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8) —
-        // booking over a DETECTED possible double-booking is a bookkeeping
+        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8):         // booking over a DETECTED possible double-booking is a bookkeeping
         // decision that needs a durable record. Best-effort; never blocks the
         // booking.
         try {
@@ -301,7 +312,7 @@ export const POST = withRouteContext(
     // rather than the hardcoded 1930 in the templates. Without this, interest
     // or fees that landed on a savings/EUR account mis-book to 1930 and the
     // real bank line never reconciles. applySettlementAccount only rewrites a
-    // 1930 leg and is a no-op when the settlement account is 1930 — so legacy
+    // 1930 leg and is a no-op when the settlement account is 1930, so legacy
     // rows with no cash_account_id behave exactly as before.
     let settlementAccount = '1930'
     if (transaction.cash_account_id) {
@@ -312,7 +323,7 @@ export const POST = withRouteContext(
         .eq('company_id', companyId)
         .maybeSingle()
       if (cashAccountError) {
-        // Don't fail the booking — fall back to 1930 — but surface the lookup
+        // Don't fail the booking: fall back to 1930, but surface the lookup
         // failure so a silent mis-booking to the wrong bank leg stays auditable.
         txLog.warn('settlement-account lookup failed; defaulting to 1930', {
           cashAccountId: transaction.cash_account_id,
@@ -409,7 +420,7 @@ export const POST = withRouteContext(
     // an open supplier invoice already covers this amount. Categorizing direct
     // to 244x leaves the invoice with status='approved' and lures the user
     // into a duplicate "Markera som betald" later. Credit must be a bank/cash
-    // account (1xxx) — 244x against a clearing account, equity, etc. isn't a
+    // account (1xxx): 244x against a clearing account, equity, etc. isn't a
     // supplier payment and the suggestion would misdirect the user.
     if (
       !body.confirm_no_match &&
@@ -480,7 +491,7 @@ export const POST = withRouteContext(
     // Prong B (customer side): intercept plain 151x categorization of an
     // inbound payment when an unpaid customer invoice already covers this
     // amount. Symmetric with the supplier-side intercept above. The debit
-    // must be a bank/cash account (^19\d{2}$, BAS class 19) — a 1xxx debit
+    // must be a bank/cash account (^19\d{2}$, BAS class 19): a 1xxx debit
     // outside class 19 isn't a payment receipt and the suggestion would
     // misdirect the user.
     if (
@@ -516,7 +527,7 @@ export const POST = withRouteContext(
 
       // Date window anchored on `due_date`, NOT `invoice_date`. Customer
       // payments arrive close to (or after) the due date; for an invoice
-      // with 60–90 day terms, anchoring on invoice_date would push the
+      // with 60-90 day terms, anchoring on invoice_date would push the
       // expected payment outside a ±60-day window and the guard would miss
       // genuine matches. due_date is the better proxy for "around when the
       // payment is expected."
@@ -635,7 +646,7 @@ export const POST = withRouteContext(
       txLog.error('failed to create transaction journal entry', err as Error)
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (rare race). Don't fall through to
-      // the partial-success path — that would mark the transaction bokförd
+      // the partial-success path: that would mark the transaction bokförd
       // with no verifikation and leave the user staring at an unclosable
       // dialog. Return a structured 400 so the row stays in "Att bokföra"
       // and the user can re-activate the account and retry.
@@ -643,7 +654,7 @@ export const POST = withRouteContext(
         return accountsNotInChartResponse(err)
       }
       // Bookkeeping errors map to Swedish via the registry. Other errors get
-      // their raw message — the categorization is preserved either way so the
+      // their raw message: the categorization is preserved either way so the
       // user can still re-book the verifikation manually.
       if (isBookkeepingError(err)) {
         journalEntryError = getErrorMessage(err, { context: 'transaction' })
@@ -701,7 +712,7 @@ export const POST = withRouteContext(
       // receipt-on-verifikation (BFL 5 kap 6 §) is satisfied. The journal entry has
       // already been committed at this point, so we can't roll it back; instead
       // surface a warning in the response so the UI can prompt the user to retry
-      // the link. Supabase JS returns { error } rather than throwing — destructure
+      // the link. Supabase JS returns { error } rather than throwing: destructure
       // and surface it, never swallow silently.
       try {
         const { error: linkErr } = await supabase
@@ -746,7 +757,7 @@ export const POST = withRouteContext(
         // unmatched. Categorizing here puts the underlag on a verifikation,
         // which is the inbox's "booked" state. Without this the inbox keeps
         // offering "Matcha mot transaktion" for an underlag that's already on a
-        // posted entry — while the transactions view (which reads the
+        // posted entry, while the transactions view (which reads the
         // doc↔verifikat link) already shows it as attached. Mirrors the
         // backfill that /attach-document does for the manual paperclip path.
         await supabase
@@ -809,7 +820,7 @@ export const POST = withRouteContext(
     // Flag any inbox underlag already matched to this transaction as booked.
     // The block above only fires when the caller passes an explicit
     // inbox_item_id (booking straight from the inbox flow). Booking the same
-    // transaction from anywhere else — the /transactions list, quick review —
+    // transaction from anywhere else (the /transactions list, quick review)
     // would otherwise leave an attached underlag stuck as "Kopplad" in the
     // inbox forever. Here we resolve it by the link itself (matched_transaction
     // _id) so the inbox reflects the booking regardless of entry point. Mirrors
@@ -859,7 +870,7 @@ export const POST = withRouteContext(
 
     if (journalEntryError) {
       // Categorization stuck but the verifikation didn't make it through.
-      // Surface as a structured warning — the response below carries the
+      // Surface as a structured warning: the response below carries the
       // user-facing message in `journal_entry_error`.
       txLog.warn('partial outcome: journal entry creation failed', {
         reason: 'journal_entry_creation_failed',

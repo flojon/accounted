@@ -1,13 +1,13 @@
 /**
  * GET /api/v1/companies/{companyId}/reports/supplier-ledger
  *
- * Accounts payable ledger (leverantörsreskontra) — unpaid supplier
+ * Accounts payable ledger (leverantörsreskontra): unpaid supplier
  * invoices grouped by supplier with aging buckets.
  */
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
@@ -17,7 +17,7 @@ registerEndpoint({
   operation: 'reports.supplier-ledger',
   method: 'GET',
   path: '/api/v1/companies/:companyId/reports/supplier-ledger',
-  summary: 'Supplier ledger — unpaid supplier invoices with aging.',
+  summary: 'Supplier ledger: unpaid supplier invoices with aging.',
   description:
     'Returns the supplier-payable ledger as of `as_of_date` (defaults to today). Each supplier entry includes outstanding invoices grouped into aging buckets. Reconciles against BAS 2440.',
   useWhen:
@@ -39,7 +39,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: z.unknown() },
+  response: { success: dataEnvelope(z.unknown()) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
@@ -54,7 +54,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
           details: { field: 'as_of_date', message: 'Expected YYYY-MM-DD.' },
         })
       }
-      // Calendar validity — regex alone accepts 2026-13-45.
+      // Calendar validity: regex alone accepts 2026-13-45.
       const probe = new Date(`${asOfDate}T00:00:00Z`)
       if (Number.isNaN(probe.getTime()) || probe.toISOString().slice(0, 10) !== asOfDate) {
         return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {

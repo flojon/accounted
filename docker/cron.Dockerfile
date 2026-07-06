@@ -1,4 +1,4 @@
-FROM alpine:3.22@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 ARG SUPERCRONIC_VERSION=v0.2.33
 ARG TARGETARCH
@@ -6,11 +6,11 @@ ARG TARGETARCH
 # SHA-256 of the supercronic v0.2.33 release binaries.
 # Computed from https://github.com/aptible/supercronic/releases/download/v0.2.33/
 # (the upstream project publishes only SHA-1 checksums, so these are recorded here).
-# Dependabot watches FROM lines, not these ARGs — bump manually when SUPERCRONIC_VERSION changes.
+# Dependabot watches FROM lines, not these ARGs: bump manually when SUPERCRONIC_VERSION changes.
 ARG SUPERCRONIC_SHA256_AMD64=feefa310da569c81b99e1027b86b27b51e6ee9ab647747b49099645120cfc671
 ARG SUPERCRONIC_SHA256_ARM64=f1f8585c66de020fef494dd636058f99949d108f569fef00016a1c8b9eb145b3
 
-# curl stays in the image — the crontab uses it at runtime to call the app.
+# curl stays in the image: the crontab uses it at runtime to call the app.
 RUN apk add --no-cache curl \
     && case ${TARGETARCH} in \
          amd64) ARCH=linux-amd64; SHA=${SUPERCRONIC_SHA256_AMD64} ;; \

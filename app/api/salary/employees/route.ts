@@ -3,9 +3,10 @@ import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { validateBody } from '@/lib/api/validate'
 import { CreateEmployeeSchema } from '@/lib/api/schemas'
-import { requireCompanyId } from '@/lib/company/context'
+import { requireCompanyId, getCompanyEntityType } from '@/lib/company/context'
 import { requireWritePermission } from '@/lib/auth/require-write'
 import { decryptPersonnummer, encryptPersonnummer, extractLast4, maskPersonnummer, validatePersonnummer } from '@/lib/salary/personnummer'
+import { isEmploymentTypeAllowedForEntity, EF_OWNER_EMPLOYMENT_ERROR } from '@/lib/salary/employment-rules'
 
 ensureInitialized()
 
@@ -34,7 +35,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  // Mask personnummer — show birthdate, hide the 4-digit suffix
+  // Mask personnummer: show birthdate, hide the 4-digit suffix
   const masked = (data || []).map(emp => ({
     ...emp,
     personnummer: maskPersonnummer(decryptPersonnummer(emp.personnummer)),
@@ -61,6 +62,15 @@ export async function POST(request: Request) {
   const pnrValidation = validatePersonnummer(body.personnummer)
   if (!pnrValidation.valid) {
     return NextResponse.json({ error: pnrValidation.error }, { status: 400 })
+  }
+
+  // An enskild firma owner cannot be put on payroll (they take egna uttag, not
+  // lön). Block owner/board employment types for EF before inserting. The DB
+  // trigger enforce_ef_no_owner_employee is the all-paths backstop; this gives
+  // a clean 400 with guidance. #782
+  const entityType = await getCompanyEntityType(supabase, companyId)
+  if (!isEmploymentTypeAllowedForEntity(entityType, body.employment_type)) {
+    return NextResponse.json({ error: EF_OWNER_EMPLOYMENT_ERROR }, { status: 400 })
   }
 
   // Encrypt personnummer
@@ -101,6 +111,8 @@ export async function POST(request: Request) {
       vaxa_stod_eligible: body.vaxa_stod_eligible,
       vaxa_stod_start: body.vaxa_stod_start || null,
       vaxa_stod_end: body.vaxa_stod_end || null,
+      // Dimensions PR8: bag for the employee's P&L cost lines at booking.
+      default_dimensions: body.default_dimensions ?? {},
     })
     .select()
     .single()

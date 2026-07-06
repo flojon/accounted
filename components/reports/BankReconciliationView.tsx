@@ -1,8 +1,10 @@
 'use client'
 
+import Link from 'next/link'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
@@ -13,7 +15,6 @@ import { AlertCircle, ChevronDown, ChevronRight, Link2, Unlink, Play, Eye, EyeOf
 import { formatCurrency, formatDate } from '@/lib/utils'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import { CashAccountSelector } from '@/components/common/CashAccountSelector'
-import { FiscalYearSelector } from '@/components/common/FiscalYearSelector'
 import { MatchVerifikationPicker, type UnlinkedGLLine } from '@/components/reconciliation/MatchVerifikationPicker'
 import {
   DropdownMenu,
@@ -29,7 +30,7 @@ import {
 } from '@/components/ui/destructive-confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { ToastAction } from '@/components/ui/toast'
-import type { CashAccount, FiscalPeriod } from '@/types'
+import type { CashAccount } from '@/types'
 
 function formatAmount(amount: number): string {
   return amount.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -43,13 +44,49 @@ const METHOD_LABELS: Record<string, string> = {
   manual: 'Manuell',
 }
 
+// journal_entries.source_type values that can appear on a bank-account GL line,
+// mapped to Swedish. Falls back to the raw value for anything unmapped so a new
+// enum value degrades to today's behaviour instead of an empty cell.
+const SOURCE_TYPE_LABELS: Record<string, string> = {
+  manual: 'Manuell',
+  import: 'Import',
+  bank_transaction: 'Banktransaktion',
+  invoice_paid: 'Kundfaktura betald',
+  invoice_cash_payment: 'Kontantfaktura',
+  supplier_invoice_paid: 'Leverantörsfaktura betald',
+  supplier_invoice_cash_payment: 'Leverantörsfaktura (kontant)',
+  salary_payment: 'Löneutbetalning',
+  system: 'System',
+  inbox_item: 'Inkorgsunderlag',
+  currency_revaluation: 'Valutaomvärdering',
+  year_end: 'Bokslut',
+  reminder_fee: 'Påminnelseavgift',
+}
+
+// Same thresholds as MatchVerifikationPicker's confidenceBadge: the dry-run
+// preview must read identically to the per-row picker.
+function confidenceLabel(confidence: number): {
+  label: string
+  variant: 'success' | 'secondary' | 'outline'
+} {
+  if (confidence >= 0.85) return { label: 'Stark', variant: 'success' }
+  if (confidence >= 0.6) return { label: 'Trolig', variant: 'secondary' }
+  return { label: 'Svag', variant: 'outline' }
+}
+
+/** Pre-tick strong matches; fuzzy (0.75) stays unticked for explicit opt-in. */
+const PRESELECT_CONFIDENCE = 0.85
+
+const matchKey = (transactionId: string, journalEntryId: string) =>
+  `${transactionId}:${journalEntryId}`
+
 // One-click bookings for transactions with no upstream invoice/voucher to match
-// against — the common "stuck on the unmatched list" cause (small ränteintäkter,
+// against: the common "stuck on the unmatched list" cause (small ränteintäkter,
 // bankavgifter, valutakursdifferenser). These reuse the existing bank_finance
 // booking templates; the categorize endpoint rewrites the bank leg to the
 // transaction's actual settlement account, so they book correctly on ANY cash
 // account (1930, a savings account, a EUR account…), not just 1930.
-// `account` is the non-bank leg (revenue/cost) — the bank leg is the selected
+// `account` is the non-bank leg (revenue/cost): the bank leg is the selected
 // account. Income templates apply to positive amounts, expense to negative.
 const QUICK_BOOK_TEMPLATES: {
   id: string
@@ -72,7 +109,7 @@ interface ReconciliationStatus {
   bank_transaction_total: number
   /**
    * @deprecated Kept on the server response for back-compat. The UI no longer
-   * reads it — `gl_1930_period_movement` is required.
+   * reads it: `gl_1930_period_movement` is required.
    */
   gl_1930_balance: number
   gl_1930_period_movement: number
@@ -122,7 +159,19 @@ interface DryRunMatch {
 // Component
 // ============================================================
 
-export function BankReconciliationView() {
+interface BankReconciliationViewProps {
+  /**
+   * The fiscal period to reconcile, from the page-level räkenskapsår selector in
+   * the report header (FocusedReport). The view no longer owns a selector of its
+   * own: that duplicate, hidden behind the loading skeleton, deadlocked the page
+   * (#771).
+   */
+  periodId: string
+  /** period_start / period_end of that period; seeds the date window (#751). */
+  periodBounds: { start: string; end: string } | null
+}
+
+export function BankReconciliationView({ periodId, periodBounds }: BankReconciliationViewProps) {
   const [status, setStatus] = useState<ReconciliationStatus | null>(null)
   const [unmatchedTx, setUnmatchedTx] = useState<UnmatchedTransaction[]>([])
   const [glLines, setGlLines] = useState<UnlinkedGLLine[]>([])
@@ -130,22 +179,28 @@ export function BankReconciliationView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // The window is scoped to a fiscal period (issue #751): a bank reconciliation
-  // is inherently per-period, and a "full history" window spans the fiscal-year
-  // boundary — mixing a prior period's movements with the current year's IB and
-  // manufacturing a phantom difference equal to the IB. dateFrom/dateTo are
-  // seeded from the selected räkenskapsår below (and stay editable as a manual
-  // override). The first fetch is gated on `periodReady` so we never flash the
-  // full-history numbers before the period is known.
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState(() => new Date().toISOString().slice(0, 10))
-  const [selectedPeriodId, setSelectedPeriodId] = useState<string | null>(null)
-  const [periodReady, setPeriodReady] = useState(false)
+  // The window is scoped to a fiscal period (issue #751/#771): a bank
+  // reconciliation is inherently per-period, and a "full history" window spans
+  // the fiscal-year boundary: mixing a prior period's movements with the current
+  // year's IB and manufacturing a phantom difference equal to the IB. The period
+  // is owned by the page-level FiscalYearSelector in the report header and passed
+  // in as props, so the view always mounts with a known window. It used to host
+  // its OWN selector inside the action bar and gate the first fetch on a
+  // `periodReady` flag, but that selector lived below the loading-skeleton
+  // early-return, so it never mounted, the flag never flipped, and the page hung
+  // on a permanent skeleton (#771). dateFrom/dateTo are seeded from periodBounds
+  // here and stay editable as a manual override (applied via "Filtrera").
+  const [dateFrom, setDateFrom] = useState(periodBounds?.start ?? '')
+  const [dateTo, setDateTo] = useState(() => {
+    const today = new Date().toISOString().slice(0, 10)
+    if (periodBounds && periodBounds.end < today) return periodBounds.end
+    return today
+  })
   const [accountNumber, setAccountNumber] = useState('1930')
   const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
   // Date filters apply on demand (the "Filtrera" button or an account switch),
   // never on every keystroke. Editing a date used to re-create fetchAll and
-  // re-trigger its effect — the "switching months reloads automatically"
+  // re-trigger its effect: the "switching months reloads automatically"
   // annoyance. fetchAll reads the live dates from refs so an explicit run always
   // uses the latest typed values without putting them in its dependency array.
   const dateFromRef = useRef(dateFrom)
@@ -158,6 +213,14 @@ export function BankReconciliationView() {
   }, [dateTo])
 
   const [dryRunResults, setDryRunResults] = useState<DryRunMatch[] | null>(null)
+  // Which preview rows apply on "Tillämpa". Strong matches (≥0.85) are
+  // pre-ticked; fuzzy ones require an explicit opt-in tick.
+  const [selectedPairs, setSelectedPairs] = useState<Set<string>>(new Set())
+  // The date window the on-screen lists were last fetched with. Preview/apply
+  // read THIS window (not the live inputs) so they can never run against a
+  // different window than the lists the user is looking at; a mismatch between
+  // typed and applied dates renders a "klicka Filtrera" hint instead.
+  const [appliedDates, setAppliedDates] = useState<{ from: string; to: string } | null>(null)
   const [runLoading, setRunLoading] = useState(false)
   const [applyLoading, setApplyLoading] = useState(false)
   const [linkLoading, setLinkLoading] = useState<string | null>(null)
@@ -168,21 +231,32 @@ export function BankReconciliationView() {
 
   // Opt-in: also surface vouchers already matched to a bank transaction as
   // candidates, so a second/third transaction can be attached to the same
-  // verifikat (N:1 — e.g. a salary run paid out in several transfers). Only
+  // verifikat (N:1, e.g. a salary run paid out in several transfers). Only
   // affects the per-row picker candidates; the "Omatchade verifikationer" table
   // below stays unmatched-only (it lists vouchers that still need a transaction).
   const [includeMatched, setIncludeMatched] = useState(false)
 
   const [showMatched, setShowMatched] = useState(false)
   // Default expanded so users discover the undo path. The card itself only
-  // renders when ignoredTx.length > 0 — collapsing it by default hid the
+  // renders when ignoredTx.length > 0: collapsing it by default hid the
   // recovery affordance from anyone who didn't already know it was there.
   const [showIgnored, setShowIgnored] = useState(true)
   const [ignoredTx, setIgnoredTx] = useState<UnmatchedTransaction[]>([])
   const [selectedMatch, setSelectedMatch] = useState<Record<string, string>>({})
-  // True when the unmatched list hit the API's 500-row cap — surfaced so a long
+  // True when the unmatched list hit the API's 500-row cap: surfaced so a long
   // date range doesn't silently hide rows and let the user think they're done.
   const [unmatchedTruncated, setUnmatchedTruncated] = useState(false)
+  // Per-transaction ranked match candidates, lazily fetched when the row's
+  // picker is first focused. Passing transaction_id to /unmatched-entries makes
+  // the server rank candidates and attach confidence: the same intelligence
+  // MatchVoucherDialog gets on the Transactions page. Keyed by transaction id;
+  // cleared whenever the lists refetch (the candidate set may have changed).
+  const [rankedCandidates, setRankedCandidates] = useState<Record<string, UnlinkedGLLine[]>>({})
+  const rankedFetchInFlight = useRef<Set<string>>(new Set())
+  // Bumped whenever fetchAll clears the ranked cache: an in-flight ranked
+  // response from before the clear must not repopulate the fresh cache, or
+  // that row's picker would show pre-refetch candidates until the next reload.
+  const rankedGenerationRef = useRef(0)
   // Aborts the previous in-flight load when the account/date filters change, so
   // a slow stale response can't overwrite the freshly-selected account's data
   // (the intermittent "flips between accounts" bug).
@@ -199,9 +273,15 @@ export function BankReconciliationView() {
 
   // glLines feeds the per-row picker (which may include already-matched vouchers
   // when includeMatched is on). The "Omatchade verifikationer" table below must
-  // stay unmatched-only — a voucher with a linked transaction isn't something
+  // stay unmatched-only: a voucher with a linked transaction isn't something
   // that still needs one.
   const unmatchedGlLines = glLines.filter((l) => !(l.linked_transaction_count ?? 0))
+
+  // The typed dates differ from what the lists (and preview/apply) run against.
+  // Surfaced as a hint so a user can't edit a date, skip Filtrera, and believe
+  // the preview covered the window they typed.
+  const datesDirty =
+    appliedDates !== null && (appliedDates.from !== dateFrom || appliedDates.to !== dateTo)
 
   useEffect(() => {
     let cancelled = false
@@ -211,15 +291,15 @@ export function BankReconciliationView() {
         if (!cancelled && Array.isArray(j.data)) setCashAccounts(j.data as CashAccount[])
       })
       .catch(() => {
-        // Non-critical — falls back to 'SEK' currency, matches old behaviour.
+        // Non-critical: falls back to 'SEK' currency, matches old behaviour.
       })
     return () => {
       cancelled = true
     }
   }, [])
 
-  const fetchAll = useCallback(async () => {
-    // Cancel any in-flight load — it may be for a different account. Without
+  const fetchAll = useCallback(async (opts?: { silent?: boolean }) => {
+    // Cancel any in-flight load: it may be for a different account. Without
     // this, switching accounts quickly lets an older response land last and
     // overwrite the current account's data.
     fetchAbortRef.current?.abort()
@@ -227,8 +307,26 @@ export function BankReconciliationView() {
     fetchAbortRef.current = controller
     const { signal } = controller
 
-    setLoading(true)
+    // Only wholesale reloads (mount, account/period switch, Filtrera) show the
+    // skeleton. Row mutations refresh silently and update in place: the old
+    // behaviour unmounted the entire page on EVERY link/unlink/quick-book,
+    // losing scroll position and flashing 30 skeletons for 30 matches.
+    if (!opts?.silent) {
+      setLoading(true)
+      // A wholesale reload means the window/account/candidate set may have
+      // changed: a preview computed for the previous window must not leave an
+      // enabled "Tillämpa" button behind. Silent row-mutation refetches keep
+      // the preview (same window; the intersection guard on apply covers rows
+      // that got linked meanwhile).
+      setDryRunResults(null)
+      setSelectedPairs(new Set())
+    }
     setError(null)
+    // The candidate pool changes with the data: drop stale per-row rankings
+    // and invalidate any ranked fetch already in flight.
+    setRankedCandidates({})
+    rankedFetchInFlight.current.clear()
+    rankedGenerationRef.current++
     try {
       const fromValue = dateFromRef.current
       const toValue = dateToRef.current
@@ -239,8 +337,8 @@ export function BankReconciliationView() {
       const qs = `?${params}`
 
       // The candidate-lines fetch optionally includes already-matched vouchers
-      // (for N:1); the status endpoint must NOT — its movement/diff is computed
-      // independently — so it keeps the plain qs.
+      // (for N:1); the status endpoint must NOT (its movement/diff is computed
+      // independently) so it keeps the plain qs.
       const glParams = new URLSearchParams(params)
       if (includeMatched) glParams.set('include_matched', 'true')
       const glQs = `?${glParams}`
@@ -267,7 +365,7 @@ export function BankReconciliationView() {
         matchedRes.json(),
       ])
 
-      // A newer load superseded this one while we awaited — discard these
+      // A newer load superseded this one while we awaited: discard these
       // stale results rather than clobber the current account's data.
       if (signal.aborted) return
 
@@ -276,9 +374,11 @@ export function BankReconciliationView() {
       setUnmatchedTx(unmatchedData.data || [])
       setMatchedTx(matchedData.data || [])
       setUnmatchedTruncated(Boolean(unmatchedData.has_more))
+      // Record the window these lists represent: preview/apply run against it.
+      setAppliedDates({ from: fromValue, to: toValue })
 
       // Refresh the ignored list whenever the main lists refresh.
-      // Deliberately NOT filtered by account or currency — if a user ignored
+      // Deliberately NOT filtered by account or currency: if a user ignored
       // a row on 1932 EUR and then switched to 1930 SEK, the recovery card
       // would disappear and the row would feel "stuck". Company-wide scope
       // keeps the Återställ path reachable from any account selection. The
@@ -306,63 +406,89 @@ export function BankReconciliationView() {
     // "Filtrera" button calls fetchAll() explicitly for date changes.
   }, [accountNumber, accountCurrency, includeMatched])
 
-  // Seed the reconciliation window from the selected räkenskapsår. dateTo is
-  // clamped to today for the current (open) year so we don't claim to reconcile
-  // into the future; a past year ends at its period_end. periodReady unblocks the
-  // gated initial fetch below. The dates stay editable via the manual inputs.
-  const handlePeriodChange = useCallback(
-    (periodId: string | null, period?: FiscalPeriod | null) => {
-      setSelectedPeriodId(periodId)
-      if (period) {
-        const today = new Date().toISOString().slice(0, 10)
-        setDateFrom(period.period_start)
-        setDateTo(period.period_end < today ? period.period_end : today)
-      }
-      setPeriodReady(true)
-    },
-    [],
-  )
-
-  // Gate the first load until the fiscal period (and therefore the date window)
-  // is known — otherwise we'd fetch once with the empty full-history window and
-  // briefly render the phantom-diff numbers before the period seeds the dates.
-  // The date-seeding setState in handlePeriodChange updates dateFromRef/dateToRef
-  // (the effects above) before this effect runs on the same render, so fetchAll
-  // reads the freshly-seeded window. selectedPeriodId is a dependency so that
-  // switching räkenskapsår re-fetches with the new window, and so a late period
-  // selection (e.g. if the selector signals ready before the company context has
-  // hydrated and onChange arrives a tick later) still triggers the real fetch.
-  // Manual date edits intentionally do NOT auto-fetch — that stays on "Filtrera".
+  // Re-seed the date window whenever the selected räkenskapsår changes (driven
+  // by the page-level FiscalYearSelector in the report header). dateTo is clamped
+  // to today for the current (open) year so we don't claim to reconcile into the
+  // future; a past year ends at its period_end.
+  //
+  // We write dateFromRef/dateToRef SYNCHRONOUSLY here, not just the state: fetchAll
+  // reads the window from the refs, and the [dateFrom]/[dateTo] sync effects above
+  // only refresh them on the NEXT commit: too late for the fetch effect below,
+  // which runs on this same period-switch commit. Without the synchronous ref
+  // write the first load after a year switch would use the PREVIOUS period's
+  // window (off-by-one). This effect MUST stay declared ABOVE the fetch effect so
+  // React runs it first.
+  //
+  // Keyed on periodId ONLY: switching the bank account must re-fetch (via the
+  // fetch effect, whose fetchAll identity changes) but must NOT re-seed the dates
+  // and discard a manual "Datum från/till" edit.
   useEffect(() => {
-    if (!periodReady) return
+    if (!periodBounds) return
+    const today = new Date().toISOString().slice(0, 10)
+    const from = periodBounds.start
+    const to = periodBounds.end < today ? periodBounds.end : today
+    setDateFrom(from)
+    setDateTo(to)
+    dateFromRef.current = from
+    dateToRef.current = to
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodId])
+
+  // Load on mount, when the bank account / currency / matched-toggle change
+  // (fetchAll identity), and when the räkenskapsår switches (periodId). fetchAll
+  // reads the window from the refs, which the effect above has already refreshed
+  // for a period switch. Manual date edits intentionally do NOT auto-fetch: that
+  // stays on the explicit "Filtrera" button (which calls fetchAll() directly).
+  useEffect(() => {
     fetchAll()
-  }, [fetchAll, periodReady, selectedPeriodId])
+  }, [fetchAll, periodId])
 
   // Reset transient per-account UI state when the selected account changes. A
   // verifikation pick or a dry-run preview computed for the previous account is
-  // meaningless against the new one — and applying it would cross-link.
+  // meaningless against the new one, and applying it would cross-link.
   useEffect(() => {
     setSelectedMatch({})
     setDryRunResults(null)
+    setSelectedPairs(new Set())
   }, [accountNumber])
 
   const handleDryRun = async () => {
     setRunLoading(true)
     setDryRunResults(null)
+    setSelectedPairs(new Set())
     try {
       const res = await fetch('/api/reconciliation/bank/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          date_from: dateFrom || undefined,
-          date_to: dateTo || undefined,
+          // The APPLIED window: never the live inputs, which may not match the
+          // lists on screen until the user clicks Filtrera.
+          date_from: appliedDates?.from || undefined,
+          date_to: appliedDates?.to || undefined,
           account_number: accountNumber,
           dry_run: true,
         }),
       })
       const result = await res.json()
+      if (!res.ok || result.error) {
+        // An error envelope parses as JSON, so the catch below never fires for
+        // it: without this check the button just stopped spinning and NOTHING
+        // rendered, leaving the user staring at an unchanged page.
+        setError(
+          typeof result.error === 'string' ? result.error : 'Kunde inte köra förhandsgranskning',
+        )
+        return
+      }
       if (result.data?.matches) {
-        setDryRunResults(result.data.matches)
+        const matches = result.data.matches as DryRunMatch[]
+        setDryRunResults(matches)
+        setSelectedPairs(
+          new Set(
+            matches
+              .filter((m) => m.confidence >= PRESELECT_CONFIDENCE)
+              .map((m) => matchKey(m.transaction_id, m.journal_entry_id)),
+          ),
+        )
       }
     } catch {
       setError('Kunde inte köra förhandsgranskning')
@@ -371,27 +497,141 @@ export function BankReconciliationView() {
     }
   }
 
+  const toggleMatchSelection = (key: string) => {
+    setSelectedPairs((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  // Matches RunReconciliationSchema's selected_matches .max(500). A first
+  // reconciliation after a year of imports can preview (and pre-tick) far more
+  // than 500 matches: applied in sequential chunks so the flow never dead-ends
+  // on the payload cap. Chunking is safe: the server intersects each chunk with
+  // a fresh match run, so pairs applied by an earlier chunk simply drop out of
+  // later ones and unselected pairs are never applied.
+  const APPLY_CHUNK_SIZE = 500
+
   const handleApply = async () => {
+    if (!dryRunResults || selectedPairs.size === 0) return
+    const selected = dryRunResults.filter((m) =>
+      selectedPairs.has(matchKey(m.transaction_id, m.journal_entry_id)),
+    )
+    const requested = selected.length
     setApplyLoading(true)
+    let applied = 0
+    let failed = false
+    let failMessage: string | undefined
     try {
-      await fetch('/api/reconciliation/bank/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          date_from: dateFrom || undefined,
-          date_to: dateTo || undefined,
-          account_number: accountNumber,
-          dry_run: false,
-        }),
-      })
-      setDryRunResults(null)
-      await fetchAll()
+      for (let i = 0; i < selected.length; i += APPLY_CHUNK_SIZE) {
+        const chunk = selected.slice(i, i + APPLY_CHUNK_SIZE)
+        const res = await fetch('/api/reconciliation/bank/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            date_from: appliedDates?.from || undefined,
+            date_to: appliedDates?.to || undefined,
+            account_number: accountNumber,
+            dry_run: false,
+            selected_matches: chunk.map((m) => ({
+              transaction_id: m.transaction_id,
+              journal_entry_id: m.journal_entry_id,
+            })),
+          }),
+        })
+        const result = await res.json()
+        if (!res.ok || result.error) {
+          failed = true
+          failMessage = typeof result.error === 'string' ? result.error : undefined
+          break
+        }
+        applied += result.data?.applied ?? 0
+      }
     } catch {
-      setError('Kunde inte tillämpa matchningar')
+      failed = true
+    }
+
+    // Report what actually happened: the old flow cleared the preview and
+    // said nothing, even when the API had failed outright.
+    if (failed) {
+      toast({
+        variant: 'destructive',
+        title:
+          applied > 0
+            ? `${applied} av ${requested} matchningar tillämpade; resten misslyckades`
+            : 'Kunde inte tillämpa matchningarna',
+        description: failMessage,
+      })
+    } else if (applied === requested) {
+      toast({
+        variant: 'success',
+        title: `${applied} ${applied === 1 ? 'matchning tillämpad' : 'matchningar tillämpade'}`,
+      })
+    } else {
+      toast({
+        variant: 'destructive',
+        title: `${applied} av ${requested} matchningar tillämpade`,
+        description:
+          'Resten kunde inte tillämpas: underlaget kan ha ändrats sedan förhandsgranskningen. Kör en ny förhandsgranskning.',
+      })
+    }
+    // Refetch whenever anything may have been written; on a clean failure with
+    // zero applied the preview survives so the user can retry.
+    try {
+      if (!failed || applied > 0) {
+        setDryRunResults(null)
+        setSelectedPairs(new Set())
+        await fetchAll({ silent: true })
+      }
     } finally {
       setApplyLoading(false)
     }
   }
+
+  /**
+   * Lazily fetch ranked, confidence-scored candidates for one transaction the
+   * first time its picker is focused. The endpoint ranks and attaches
+   * confidence when transaction_id is passed: without it every row shows the
+   * same unranked list and no Stark/Trolig/Svag badges (the intelligence the
+   * Transactions page's MatchVoucherDialog has had all along).
+   */
+  const ensureRankedCandidates = useCallback(
+    async (transactionId: string) => {
+      if (rankedCandidates[transactionId] || rankedFetchInFlight.current.has(transactionId)) {
+        return
+      }
+      rankedFetchInFlight.current.add(transactionId)
+      const generation = rankedGenerationRef.current
+      try {
+        const params = new URLSearchParams()
+        // The APPLIED window: the same one the lists and preview run against.
+        // Reading the live refs here would let a typed-but-not-filtered date
+        // silently give this row a different candidate set than the tables on
+        // screen. Refs are only the pre-first-load fallback.
+        const from = appliedDates?.from ?? dateFromRef.current
+        const to = appliedDates?.to ?? dateToRef.current
+        if (from) params.set('date_from', from)
+        if (to) params.set('date_to', to)
+        params.set('account_number', accountNumber)
+        params.set('transaction_id', transactionId)
+        if (includeMatched) params.set('include_matched', 'true')
+        const res = await fetch(`/api/reconciliation/bank/unmatched-entries?${params}`)
+        const json = await res.json()
+        // Discard if fetchAll cleared the cache while we were in flight:
+        // committing would pin pre-refetch candidates on this row.
+        if (res.ok && Array.isArray(json.data) && rankedGenerationRef.current === generation) {
+          setRankedCandidates((prev) => ({ ...prev, [transactionId]: json.data }))
+        }
+      } catch {
+        // Non-critical: the picker falls back to the unranked shared list.
+      } finally {
+        rankedFetchInFlight.current.delete(transactionId)
+      }
+    },
+    [accountNumber, includeMatched, rankedCandidates, appliedDates],
+  )
 
   const handleManualLink = async (transactionId: string) => {
     const journalEntryId = selectedMatch[transactionId]
@@ -409,18 +649,25 @@ export function BankReconciliationView() {
         }),
       })
       const result = await res.json()
-      if (result.error) {
-        setError(result.error)
+      if (!res.ok || result.error) {
+        // Row-level failures surface next to where the user is working: the
+        // old top-of-page banner was off-screen when acting on row 40.
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte matcha transaktionen',
+          description: typeof result.error === 'string' ? result.error : undefined,
+        })
       } else {
         setSelectedMatch((prev) => {
           const next = { ...prev }
           delete next[transactionId]
           return next
         })
-        await fetchAll()
+        toast({ variant: 'success', title: 'Transaktionen matchades mot verifikationen' })
+        await fetchAll({ silent: true })
       }
     } catch {
-      setError('Kunde inte matcha transaktion')
+      toast({ variant: 'destructive', title: 'Kunde inte matcha transaktionen' })
     } finally {
       setLinkLoading(null)
     }
@@ -435,13 +682,18 @@ export function BankReconciliationView() {
         body: JSON.stringify({ transaction_id: transactionId }),
       })
       const result = await res.json()
-      if (result.error) {
-        setError(result.error)
+      if (!res.ok || result.error) {
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte avmatcha transaktionen',
+          description: typeof result.error === 'string' ? result.error : undefined,
+        })
       } else {
-        await fetchAll()
+        toast({ variant: 'success', title: 'Matchningen togs bort' })
+        await fetchAll({ silent: true })
       }
     } catch {
-      setError('Kunde inte avmatcha transaktion')
+      toast({ variant: 'destructive', title: 'Kunde inte avmatcha transaktionen' })
     } finally {
       setUnlinkLoading(null)
     }
@@ -452,7 +704,7 @@ export function BankReconciliationView() {
    * source_type='opening_balance'. Such a voucher (common after a migration
    * where the IB was booked as an ordinary verifikat) otherwise stays in the
    * period movement and shows up as a phantom difference equal to the IB. After
-   * re-tagging it drops out of the diff and is surfaced as "IB — räknas inte".
+   * re-tagging it drops out of the diff and is surfaced as "IB: räknas inte".
    */
   const handleMarkOpeningBalance = async (journalEntryId: string) => {
     setMarkLoading(journalEntryId)
@@ -463,13 +715,21 @@ export function BankReconciliationView() {
         body: JSON.stringify({ journal_entry_id: journalEntryId }),
       })
       const result = await res.json()
-      if (result.error) {
-        setError(result.error)
+      if (!res.ok || result.error) {
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte markera verifikationen som ingående balans',
+          description: typeof result.error === 'string' ? result.error : undefined,
+        })
       } else {
-        await fetchAll()
+        toast({ variant: 'success', title: 'Verifikationen markerades som ingående balans' })
+        await fetchAll({ silent: true })
       }
     } catch {
-      setError('Kunde inte markera verifikationen som ingående balans')
+      toast({
+        variant: 'destructive',
+        title: 'Kunde inte markera verifikationen som ingående balans',
+      })
     } finally {
       setMarkLoading(null)
     }
@@ -480,7 +740,7 @@ export function BankReconciliationView() {
    * voucher to match against (ränteintäkter, bankavgifter, valutakurs-
    * differenser). Calls the standard categorize endpoint with a bank_finance
    * template so the resulting verifikation is identical to the /transactions
-   * flow — no parallel booking path. The categorize endpoint rewrites the bank
+   * flow: no parallel booking path. The categorize endpoint rewrites the bank
    * leg to the transaction's actual settlement account, so this is correct on
    * any cash account.
    */
@@ -498,16 +758,25 @@ export function BankReconciliationView() {
       })
       const result = await res.json()
       if (!res.ok || result.error) {
-        setError(result.error?.message || result.error || 'Kunde inte bokföra transaktionen')
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte bokföra transaktionen',
+          description: result.error?.message || (typeof result.error === 'string' ? result.error : undefined),
+        })
         return
       }
       if (result.journal_entry_error) {
-        setError(result.journal_entry_error)
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte bokföra transaktionen',
+          description: result.journal_entry_error,
+        })
         return
       }
-      await fetchAll()
+      toast({ variant: 'success', title: 'Transaktionen bokfördes' })
+      await fetchAll({ silent: true })
     } catch {
-      setError('Kunde inte bokföra transaktionen')
+      toast({ variant: 'destructive', title: 'Kunde inte bokföra transaktionen' })
     } finally {
       setActionLoading(null)
     }
@@ -515,13 +784,13 @@ export function BankReconciliationView() {
 
   const handleIgnore = async (tx: UnmatchedTransaction) => {
     // Even though Ignorera is fully reversible, it's still a state change the
-    // user could miss after a misclick — the row vanishes from the unmatched
+    // user could miss after a misclick: the row vanishes from the unmatched
     // list immediately. Confirmation before the write + an explicit Ångra
     // toast on success gives two recovery affordances. The persistent
     // "Ignorerade transaktioner" card is the third.
     const ok = await confirm({
       title: 'Ignorera transaktionen?',
-      description: `${tx.description} — ${formatCurrency(tx.amount)} (${formatDate(tx.date)}) försvinner från avstämningen utan att bokföras. Du kan återställa den från "Ignorerade transaktioner" nedan när som helst.`,
+      description: `${tx.description}: ${formatCurrency(tx.amount, tx.currency)} (${formatDate(tx.date)}) försvinner från avstämningen utan att bokföras. Du kan återställa den från "Ignorerade transaktioner" nedan när som helst.`,
       confirmLabel: 'Ignorera',
       cancelLabel: 'Avbryt',
       variant: 'warning',
@@ -535,13 +804,17 @@ export function BankReconciliationView() {
       })
       const result = await res.json()
       if (!res.ok || result.error) {
-        setError(result.error || 'Kunde inte ignorera transaktionen')
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte ignorera transaktionen',
+          description: typeof result.error === 'string' ? result.error : undefined,
+        })
         return
       }
-      await fetchAll()
+      await fetchAll({ silent: true })
       toast({
         title: 'Transaktionen ignorerad',
-        description: `${tx.description} — ${formatCurrency(tx.amount)}`,
+        description: `${tx.description}: ${formatCurrency(tx.amount, tx.currency)}`,
         action: (
           <ToastAction
             altText="Ångra ignorera"
@@ -552,7 +825,7 @@ export function BankReconciliationView() {
         ),
       })
     } catch {
-      setError('Kunde inte ignorera transaktionen')
+      toast({ variant: 'destructive', title: 'Kunde inte ignorera transaktionen' })
     } finally {
       setActionLoading(null)
     }
@@ -566,12 +839,16 @@ export function BankReconciliationView() {
       })
       const result = await res.json()
       if (!res.ok || result.error) {
-        setError(result.error || 'Kunde inte återställa transaktionen')
+        toast({
+          variant: 'destructive',
+          title: 'Kunde inte återställa transaktionen',
+          description: typeof result.error === 'string' ? result.error : undefined,
+        })
         return
       }
-      await fetchAll()
+      await fetchAll({ silent: true })
     } catch {
-      setError('Kunde inte återställa transaktionen')
+      toast({ variant: 'destructive', title: 'Kunde inte återställa transaktionen' })
     } finally {
       setActionLoading(null)
     }
@@ -626,15 +903,21 @@ export function BankReconciliationView() {
               )}
             </div>
             <p className="mt-2 text-xs text-muted-foreground">
-              Avstämningen körs mot <AccountNumber number={accountNumber} /> ({accountCurrency}). Övriga bankkonton (t.ex. Plusgiro <AccountNumber number="1920" />, kreditkort <AccountNumber number="1940" /> eller valutakonton) stäms av separat — välj kontot i listan nedan.
+              Avstämningen körs mot <AccountNumber number={accountNumber} /> ({accountCurrency}). Övriga bankkonton (t.ex. Plusgiro <AccountNumber number="1920" />, kreditkort <AccountNumber number="1940" /> eller valutakonton) stäms av separat. Välj kontot i listan nedan.
             </p>
           </CardHeader>
           <CardContent>
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span>Banktransaktioner i perioden</span>
-                <span className="tabular-nums">{formatCurrency(status.bank_transaction_total)}</span>
+                <span className="tabular-nums">
+                  {formatCurrency(status.bank_transaction_total, accountCurrency)}
+                </span>
               </div>
+              {/* GL-side figures (bokfört, IB, rättelser, differens) stay in
+                  SEK: journal entries are booked in SEK regardless of the
+                  cash account's currency. Only the bank-feed total above is in
+                  the account's own currency. */}
               <div className="flex justify-between">
                 <span>Bokfört på <AccountNumber number={accountNumber} /> i perioden</span>
                 <span className="tabular-nums">
@@ -643,22 +926,30 @@ export function BankReconciliationView() {
               </div>
               <div className="flex justify-between pt-2 border-t font-semibold">
                 <span>Differens</span>
-                <span>
+                <span
+                  className={`tabular-nums ${
+                    status.is_reconciled ? 'text-success' : 'text-destructive'
+                  }`}
+                >
                   {formatCurrency(status.difference)}
                 </span>
               </div>
               {status.gl_1930_opening_balance !== 0 && (
                 <p className="pt-2 text-xs text-muted-foreground">
                   Ingående balans (IB) på <AccountNumber number={accountNumber} />:{' '}
-                  <span className="tabular-nums">{formatCurrency(status.gl_1930_opening_balance)}</span>
-                  {' '}— räknas inte i avstämningen.
+                  <span className="tabular-nums">
+                    {formatCurrency(status.gl_1930_opening_balance)}
+                  </span>
+                  , räknas inte i avstämningen.
                 </p>
               )}
               {status.gl_1930_correction_adjustment !== 0 && (
                 <p className="pt-2 text-xs text-muted-foreground">
                   Varav rättelser och stornon på <AccountNumber number={accountNumber} /> i perioden:{' '}
-                  <span className="tabular-nums">{formatCurrency(status.gl_1930_correction_adjustment)}</span>
-                  {' '}— ingår i det bokförda beloppet och i avstämningen, precis som i balansräkningen.
+                  <span className="tabular-nums">
+                    {formatCurrency(status.gl_1930_correction_adjustment)}
+                  </span>
+                  , ingår i det bokförda beloppet och i avstämningen, precis som i balansräkningen.
                 </p>
               )}
               <div className="flex gap-4 pt-2 text-xs text-muted-foreground">
@@ -679,13 +970,6 @@ export function BankReconciliationView() {
               value={accountNumber}
               onChange={setAccountNumber}
             />
-            <FiscalYearSelector
-              value={selectedPeriodId}
-              onChange={handlePeriodChange}
-              onReady={() => setPeriodReady(true)}
-              includeAllOption={false}
-              hideFuturePeriods
-            />
             <div>
               <Label>Datum från</Label>
               <Input
@@ -704,21 +988,29 @@ export function BankReconciliationView() {
                 className="mt-1"
               />
             </div>
-            <Button onClick={fetchAll} variant="outline">
+            <Button onClick={() => fetchAll()} variant={datesDirty ? 'default' : 'outline'}>
               Filtrera
             </Button>
             <div className="flex-1" />
-            <Button onClick={handleDryRun} disabled={runLoading} variant="outline">
+            <Button onClick={handleDryRun} disabled={runLoading || datesDirty} variant="outline">
               <Eye className="h-4 w-4 mr-2" />
               {runLoading ? 'Analyserar...' : 'Förhandsgranska'}
             </Button>
             {dryRunResults && dryRunResults.length > 0 && (
-              <Button onClick={handleApply} disabled={applyLoading}>
+              <Button onClick={handleApply} disabled={applyLoading || selectedPairs.size === 0}>
                 <Play className="h-4 w-4 mr-2" />
-                {applyLoading ? 'Tillämpar...' : `Tillämpa ${dryRunResults.length} matchningar`}
+                {applyLoading
+                  ? 'Tillämpar...'
+                  : `Tillämpa ${selectedPairs.size} ${selectedPairs.size === 1 ? 'matchning' : 'matchningar'}`}
               </Button>
             )}
           </div>
+          {datesDirty && (
+            <p className="mt-3 text-xs text-muted-foreground">
+              Datumfiltret är ändrat men inte tillämpat: klicka Filtrera för att uppdatera
+              listorna innan du förhandsgranskar.
+            </p>
+          )}
         </CardContent>
       </Card>
 
@@ -727,43 +1019,72 @@ export function BankReconciliationView() {
         <Card>
           <CardHeader>
             <CardTitle className="text-lg">
-              Förhandsgranskning — {dryRunResults.length} matchningar hittade
+              Förhandsgranskning: {dryRunResults.length}{' '}
+              {dryRunResults.length === 1 ? 'matchning hittad' : 'matchningar hittade'}
             </CardTitle>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Starka träffar är förvalda. Ungefärliga träffar kräver att du bockar i dem själv:
+              granska verifikationen först.
+            </p>
           </CardHeader>
           <CardContent>
-            <table className="w-full text-sm">
-              <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
-                <tr className="border-b text-left">
-                  <th className="py-2">Transaktion</th>
-                  <th className="py-2 w-24">Datum</th>
-                  <th className="py-2 w-28 text-right">Belopp</th>
-                  <th className="py-2 w-8 text-center">&harr;</th>
-                  <th className="py-2">Verifikation</th>
-                  <th className="py-2 w-24">Datum</th>
-                  <th className="py-2 w-28">Metod</th>
-                </tr>
-              </thead>
-              <tbody>
-                {dryRunResults.map((m) => (
-                  <tr key={m.transaction_id} className="border-b last:border-0">
-                    <td className="py-2 truncate max-w-[180px]">{m.transaction_description}</td>
-                    <td className="py-2 tabular-nums">{formatDate(m.transaction_date)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatAmount(m.transaction_amount)}</td>
-                    <td className="py-2 text-center text-muted-foreground">&harr;</td>
-                    <td className="py-2">
-                      <span className="font-mono text-xs">{formatVoucher(m)}</span>
-                      <span className="ml-2 text-muted-foreground truncate">{m.entry_description}</span>
-                    </td>
-                    <td className="py-2 tabular-nums">{formatDate(m.entry_date)}</td>
-                    <td className="py-2">
-                      <Badge variant="outline" className="text-xs">
-                        {METHOD_LABELS[m.method] || m.method}
-                      </Badge>
-                    </td>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                  <tr className="border-b text-left">
+                    <th className="py-2 w-8"></th>
+                    <th className="py-2">Transaktion</th>
+                    <th className="py-2 w-24">Datum</th>
+                    <th className="py-2 w-28 text-right">Belopp</th>
+                    <th className="py-2 w-8 text-center">&harr;</th>
+                    <th className="py-2">Verifikation</th>
+                    <th className="py-2 w-24">Datum</th>
+                    <th className="py-2 w-28">Metod</th>
+                    <th className="py-2 w-20">Träff</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {dryRunResults.map((m) => {
+                    const key = matchKey(m.transaction_id, m.journal_entry_id)
+                    const badge = confidenceLabel(m.confidence)
+                    return (
+                      <tr key={key} className="border-b last:border-0">
+                        <td className="py-2">
+                          <Checkbox
+                            checked={selectedPairs.has(key)}
+                            onCheckedChange={() => toggleMatchSelection(key)}
+                            aria-label={`Tillämpa matchning för ${m.transaction_description}`}
+                          />
+                        </td>
+                        <td className="py-2 truncate max-w-[180px]">{m.transaction_description}</td>
+                        <td className="py-2 tabular-nums">{formatDate(m.transaction_date)}</td>
+                        <td className="py-2 text-right tabular-nums">{formatAmount(m.transaction_amount)}</td>
+                        <td className="py-2 text-center text-muted-foreground">&harr;</td>
+                        <td className="py-2">
+                          <Link
+                            href={`/bookkeeping/${m.journal_entry_id}`}
+                            className="font-mono text-xs underline-offset-2 hover:underline"
+                            target="_blank"
+                          >
+                            {formatVoucher(m)}
+                          </Link>
+                          <span className="ml-2 text-muted-foreground truncate">{m.entry_description}</span>
+                        </td>
+                        <td className="py-2 tabular-nums">{formatDate(m.entry_date)}</td>
+                        <td className="py-2">
+                          <span className="text-xs text-muted-foreground">
+                            {METHOD_LABELS[m.method] || m.method}
+                          </span>
+                        </td>
+                        <td className="py-2">
+                          <Badge variant={badge.variant}>{badge.label}</Badge>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           </CardContent>
         </Card>
       )}
@@ -801,7 +1122,7 @@ export function BankReconciliationView() {
           </div>
           {unmatchedTruncated && (
             <p className="text-xs text-muted-foreground">
-              Visar de senaste 500 transaktionerna — begränsa datumintervallet för att se fler.
+              Visar de senaste 500 transaktionerna: begränsa datumintervallet för att se fler.
             </p>
           )}
           <div className="space-y-3">
@@ -825,9 +1146,7 @@ export function BankReconciliationView() {
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground tabular-nums">
                         <span>{formatDate(tx.date)}</span>
                         <span aria-hidden>·</span>
-                        <Badge variant="outline" className="text-[10px] uppercase tracking-wider">
-                          {tx.currency}
-                        </Badge>
+                        <span>{tx.currency}</span>
                         {tx.reference && (
                           <>
                             <span aria-hidden>·</span>
@@ -844,7 +1163,7 @@ export function BankReconciliationView() {
                         }`}
                       >
                         {isPositive ? '+' : ''}
-                        {formatCurrency(tx.amount)}
+                        {formatCurrency(tx.amount, tx.currency)}
                       </div>
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
@@ -920,9 +1239,16 @@ export function BankReconciliationView() {
                       )}
                     </div>
                     <div className="flex items-start gap-2">
-                      <div className="flex-1 min-w-0">
+                      <div
+                        className="flex-1 min-w-0"
+                        // First focus fetches ranked, confidence-scored candidates
+                        // for THIS transaction (server-side ranking via
+                        // transaction_id). Until they land the picker shows the
+                        // shared unranked pool, so nothing blocks.
+                        onFocusCapture={() => ensureRankedCandidates(tx.id)}
+                      >
                         <MatchVerifikationPicker
-                          glLines={glLines}
+                          glLines={rankedCandidates[tx.id] ?? glLines}
                           value={selectedMatch[tx.id] || ''}
                           onChange={(v) =>
                             setSelectedMatch((prev) => ({ ...prev, [tx.id]: v }))
@@ -959,55 +1285,65 @@ export function BankReconciliationView() {
           </CardHeader>
           <CardContent>
             <p className="mb-3 text-xs text-muted-foreground">
-              Är en manuellt eller importerat bokförd verifikation egentligen en ingående balans? Markera den som IB — då räknas den inte med i avstämningen utan visas separat som ingående balans.
+              Är en manuellt eller importerat bokförd verifikation egentligen en ingående balans? Markera den som IB: då räknas den inte med i avstämningen utan visas separat som ingående balans.
             </p>
-            <table className="w-full text-sm">
-              <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
-                <tr className="border-b text-left">
-                  <th className="py-2 w-16">Ver.nr</th>
-                  <th className="py-2 w-24">Datum</th>
-                  <th className="py-2">Beskrivning</th>
-                  <th className="py-2 w-28 text-right">Belopp</th>
-                  <th className="py-2 w-24">Typ</th>
-                  <th className="py-2 w-36"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {unmatchedGlLines.map((line) => {
-                  const amount = line.debit_amount > 0 ? line.debit_amount : -line.credit_amount
-                  const isRetaggable = line.source_type === 'manual' || line.source_type === 'import'
-                  return (
-                    <tr key={line.line_id} className="border-b last:border-0">
-                      <td className="py-2 font-mono text-xs">
-                        {formatVoucher(line)}
-                      </td>
-                      <td className="py-2 tabular-nums">{formatDate(line.entry_date)}</td>
-                      <td className="py-2 truncate max-w-[300px]">
-                        {line.line_description || line.entry_description}
-                      </td>
-                      <td className="py-2 text-right tabular-nums">
-                        {formatCurrency(amount)}
-                      </td>
-                      <td className="py-2 text-xs text-muted-foreground">{line.source_type}</td>
-                      <td className="py-2 text-right">
-                        {isRetaggable && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-8 text-xs"
-                            disabled={markLoading === line.journal_entry_id}
-                            onClick={() => handleMarkOpeningBalance(line.journal_entry_id)}
-                            title="Markera verifikationen som ingående balans — den utesluts då från avstämningen"
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                  <tr className="border-b text-left">
+                    <th className="py-2 w-16">Ver.nr</th>
+                    <th className="py-2 w-24">Datum</th>
+                    <th className="py-2">Beskrivning</th>
+                    <th className="py-2 w-28 text-right">Belopp</th>
+                    <th className="py-2 w-24">Typ</th>
+                    <th className="py-2 w-36"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {unmatchedGlLines.map((line) => {
+                    const amount = line.debit_amount > 0 ? line.debit_amount : -line.credit_amount
+                    const isRetaggable = line.source_type === 'manual' || line.source_type === 'import'
+                    return (
+                      <tr key={line.line_id} className="border-b last:border-0">
+                        <td className="py-2">
+                          <Link
+                            href={`/bookkeeping/${line.journal_entry_id}`}
+                            className="font-mono text-xs underline-offset-2 hover:underline"
+                            target="_blank"
                           >
-                            {markLoading === line.journal_entry_id ? 'Markerar…' : 'Märk som IB'}
-                          </Button>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                            {formatVoucher(line)}
+                          </Link>
+                        </td>
+                        <td className="py-2 tabular-nums">{formatDate(line.entry_date)}</td>
+                        <td className="py-2 truncate max-w-[300px]">
+                          {line.line_description || line.entry_description}
+                        </td>
+                        <td className="py-2 text-right tabular-nums">
+                          {formatCurrency(amount)}
+                        </td>
+                        <td className="py-2 text-xs text-muted-foreground">
+                          {SOURCE_TYPE_LABELS[line.source_type] ?? line.source_type}
+                        </td>
+                        <td className="py-2 text-right">
+                          {isRetaggable && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-8 text-xs"
+                              disabled={markLoading === line.journal_entry_id}
+                              onClick={() => handleMarkOpeningBalance(line.journal_entry_id)}
+                              title="Markera verifikationen som ingående balans: den utesluts då från avstämningen"
+                            >
+                              {markLoading === line.journal_entry_id ? 'Markerar…' : 'Märk som IB'}
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           </CardContent>
         </Card>
       )}
@@ -1033,43 +1369,45 @@ export function BankReconciliationView() {
           {showIgnored && (
             <CardContent>
               <p className="text-xs text-muted-foreground mb-3">
-                Rader du valt att dölja från avstämningen. De påverkar inte saldot på <AccountNumber number={accountNumber} /> — de är bara gömda från listan.
+                Rader du valt att dölja från avstämningen. De påverkar inte saldot på <AccountNumber number={accountNumber} />: de är bara gömda från listan.
               </p>
-              <table className="w-full text-sm">
-                <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
-                  <tr className="border-b text-left">
-                    <th className="py-2 w-24">Datum</th>
-                    <th className="py-2">Beskrivning</th>
-                    <th className="py-2 w-20">Valuta</th>
-                    <th className="py-2 w-28 text-right">Belopp</th>
-                    <th className="py-2 w-28"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ignoredTx.map((tx) => (
-                    <tr key={tx.id} className="border-b last:border-0 text-muted-foreground">
-                      <td className="py-2">{tx.date}</td>
-                      <td className="py-2 truncate max-w-[300px]">{tx.description}</td>
-                      <td className="py-2 text-xs">
-                        <Badge variant="outline" className="text-xs">{tx.currency}</Badge>
-                      </td>
-                      <td className="py-2 text-right tabular-nums">
-                        {formatCurrency(tx.amount)}
-                      </td>
-                      <td className="py-2">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          disabled={actionLoading === tx.id}
-                          onClick={() => handleUnignore(tx.id)}
-                        >
-                          {actionLoading === tx.id ? '...' : 'Återställ'}
-                        </Button>
-                      </td>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                    <tr className="border-b text-left">
+                      <th className="py-2 w-24">Datum</th>
+                      <th className="py-2">Beskrivning</th>
+                      <th className="py-2 w-20">Valuta</th>
+                      <th className="py-2 w-28 text-right">Belopp</th>
+                      <th className="py-2 w-28"></th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {ignoredTx.map((tx) => (
+                      <tr key={tx.id} className="border-b last:border-0 text-muted-foreground">
+                        <td className="py-2 tabular-nums">{formatDate(tx.date)}</td>
+                        <td className="py-2 truncate max-w-[300px]">{tx.description}</td>
+                        <td className="py-2 text-xs">
+                          <span className="tabular-nums">{tx.currency}</span>
+                        </td>
+                        <td className="py-2 text-right tabular-nums">
+                          {formatCurrency(tx.amount, tx.currency)}
+                        </td>
+                        <td className="py-2">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={actionLoading === tx.id}
+                            onClick={() => handleUnignore(tx.id)}
+                          >
+                            {actionLoading === tx.id ? '...' : 'Återställ'}
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </CardContent>
           )}
         </Card>
@@ -1095,48 +1433,62 @@ export function BankReconciliationView() {
           </CardHeader>
           {showMatched && (
             <CardContent>
-              <table className="w-full text-sm">
-                <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
-                  <tr className="border-b text-left">
-                    <th className="py-2 w-24">Datum</th>
-                    <th className="py-2">Beskrivning</th>
-                    <th className="py-2 w-28 text-right">Belopp</th>
-                    <th className="py-2 w-32">Metod</th>
-                    <th className="py-2 w-24"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {matchedTx.map((tx) => (
-                    <tr key={tx.id} className="border-b last:border-0">
-                      <td className="py-2">{tx.date}</td>
-                      <td className="py-2 truncate max-w-[300px]">{tx.description}</td>
-                      <td className="py-2 text-right tabular-nums">
-                        {formatCurrency(tx.amount)}
-                      </td>
-                      <td className="py-2">
-                        {tx.reconciliation_method && (
-                          <Badge variant="outline" className="text-xs">
-                            {METHOD_LABELS[tx.reconciliation_method] || tx.reconciliation_method}
-                          </Badge>
-                        )}
-                      </td>
-                      <td className="py-2">
-                        {tx.reconciliation_method && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            disabled={unlinkLoading === tx.id}
-                            onClick={() => handleUnlink(tx.id)}
-                          >
-                            <Unlink className="h-3 w-3 mr-1" />
-                            {unlinkLoading === tx.id ? '...' : 'Avmatcha'}
-                          </Button>
-                        )}
-                      </td>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                    <tr className="border-b text-left">
+                      <th className="py-2 w-24">Datum</th>
+                      <th className="py-2">Beskrivning</th>
+                      <th className="py-2 w-28 text-right">Belopp</th>
+                      <th className="py-2 w-32">Metod</th>
+                      <th className="py-2 w-28">Verifikation</th>
+                      <th className="py-2 w-24"></th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {matchedTx.map((tx) => (
+                      <tr key={tx.id} className="border-b last:border-0">
+                        <td className="py-2 tabular-nums">{formatDate(tx.date)}</td>
+                        <td className="py-2 truncate max-w-[300px]">{tx.description}</td>
+                        <td className="py-2 text-right tabular-nums">
+                          {formatCurrency(tx.amount, accountCurrency)}
+                        </td>
+                        <td className="py-2">
+                          {tx.reconciliation_method && (
+                            <span className="text-xs text-muted-foreground">
+                              {METHOD_LABELS[tx.reconciliation_method] || tx.reconciliation_method}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2">
+                          {tx.journal_entry_id && (
+                            <Link
+                              href={`/bookkeeping/${tx.journal_entry_id}`}
+                              className="text-xs underline-offset-2 hover:underline"
+                              target="_blank"
+                            >
+                              Öppna verifikat
+                            </Link>
+                          )}
+                        </td>
+                        <td className="py-2">
+                          {tx.reconciliation_method && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              disabled={unlinkLoading === tx.id}
+                              onClick={() => handleUnlink(tx.id)}
+                            >
+                              <Unlink className="h-3 w-3 mr-1" />
+                              {unlinkLoading === tx.id ? '...' : 'Avmatcha'}
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </CardContent>
           )}
         </Card>

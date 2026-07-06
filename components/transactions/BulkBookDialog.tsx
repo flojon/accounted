@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { createClient } from '@/lib/supabase/client'
 import { useCompany } from '@/contexts/CompanyContext'
+import { resolveAccount } from '@/lib/cash-accounts/resolve-account'
+import type { CashAccount } from '@/types'
 import {
   Dialog,
   DialogContent,
@@ -12,16 +14,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { applyTemplate } from '@/lib/bookkeeping/template-library'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
+import LineDimensionFields from '@/components/dimensions/LineDimensionFields'
 import { Loader2, FileText, AlertTriangle, Check, Plus, Trash2, Paperclip } from 'lucide-react'
 import type { BookingTemplateLibrary, BookingTemplateLibraryLine } from '@/types'
 import type { TransactionWithInvoice } from './transaction-types'
@@ -81,10 +84,18 @@ export default function BulkBookDialog({
   const [templates, setTemplates] = useState<BookingTemplateLibrary[]>([])
   const [loadingTemplates, setLoadingTemplates] = useState(true)
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
+  // null = fetch pending; array = loaded (may be empty on error: falls back to '1930')
+  const [cashAccounts, setCashAccounts] = useState<CashAccount[] | null>(null)
   const [mode, setMode] = useState<Mode>('one_line_per_tx')
   const [description, setDescription] = useState('')
   const [manualLines, setManualLines] = useState<ManualLine[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // Dimension tagging (kostnadsställe/projekt): the pair renders only when
+  // company_settings.dimensions_enabled, same gate as JournalEntryForm. One
+  // header-level default bag applies to both tabs; the server tags the
+  // generated voucher's lines with it.
+  const [dimensionsEnabled, setDimensionsEnabled] = useState(false)
+  const [defaultDims, setDefaultDims] = useState<Record<string, string>>({})
 
   // Documents that will inherit onto the new verifikat. Computed from
   // transactions.document_id; the RPC reads these and updates each doc's
@@ -137,6 +148,44 @@ export default function BulkBookDialog({
     }
   }, [open, company, supabase])
 
+  // Fetch cash accounts once when the dialog opens so the manual bank-leg
+  // pre-fill can resolve the correct ledger account per transaction.
+  useEffect(() => {
+    if (!open) return
+    setCashAccounts(null)
+    let cancelled = false
+    fetch('/api/cash-accounts')
+      .then((r) => {
+        if (!r.ok) throw new Error(`cash-accounts fetch failed: ${r.status}`)
+        return r.json()
+      })
+      .then((json) => {
+        if (cancelled) return
+        setCashAccounts((json.data ?? []) as CashAccount[])
+      })
+      .catch(() => {
+        // Fall back to empty list: resolveAccount will return '1930'
+        if (!cancelled) setCashAccounts([])
+      })
+    return () => { cancelled = true }
+  }, [open])
+
+  // Company settings gate the dimension affordance (dimensions_enabled).
+  // Fetched once per open; on failure the pair simply stays hidden.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    fetch('/api/settings')
+      .then((r) => r.json())
+      .then(({ data }) => {
+        if (!cancelled) setDimensionsEnabled(data?.dimensions_enabled === true)
+      })
+      .catch(() => {
+        if (!cancelled) setDimensionsEnabled(false)
+      })
+    return () => { cancelled = true }
+  }, [open])
+
   // Reset state when dialog closes so the next open starts clean.
   useEffect(() => {
     if (!open) {
@@ -145,33 +194,46 @@ export default function BulkBookDialog({
       setMode('one_line_per_tx')
       setDescription('')
       setManualLines([])
+      setCashAccounts(null)
+      setDefaultDims({})
     } else if (sharedDate) {
       // Pre-fill description with a sensible default the user can edit.
       setDescription(t('default_description', { date: sharedDate }))
     }
   }, [open, sharedDate, t])
 
-  // Pre-fill the bank side from the txs (one line per tx on 1930 with
-  // the correct Dr/Cr direction). We intentionally do NOT pre-fill a
-  // counterpart account: swedish-compliance flagged that a hardcoded
-  // 3001/5800 prefill nudges users into submitting verifikat without a
-  // VAT line (26xx) for momsregistrerade affärshändelser. The bank
-  // side is the unambiguous part the user always wants; the
+  // Pre-fill the bank side from the txs (one line per tx with the resolved
+  // ledger account and correct Dr/Cr direction). We intentionally do NOT
+  // pre-fill a counterpart account: swedish-compliance flagged that a
+  // hardcoded 3001/5800 prefill nudges users into submitting verifikat
+  // without a VAT line (26xx) for momsregistrerade affärshändelser. The
+  // bank side is the unambiguous part the user always wants; the
   // counterpart (and any VAT split) is the user's responsibility.
+  // Gate on cashAccounts !== null so lines are only built after the account
+  // fetch resolves: this prevents the form from briefly showing '1930' when
+  // the resolved account differs.
   useEffect(() => {
     if (tab !== 'manual') return
     if (manualLines.length > 0) return
     if (transactions.length === 0) return
+    if (cashAccounts === null) return
     const isIncome = direction === 'income'
-    const bankLines: ManualLine[] = transactions.map((tx) => ({
-      id: newManualLineId(),
-      account_number: '1930',
-      debit_amount: isIncome ? Math.abs(tx.amount).toFixed(2).replace('.', ',') : '',
-      credit_amount: isIncome ? '' : Math.abs(tx.amount).toFixed(2).replace('.', ','),
-      line_description: (tx.description || '').slice(0, 40).trim(),
-    }))
+    const bankLines: ManualLine[] = transactions.map((tx) => {
+      const { account } = resolveAccount(
+        cashAccounts,
+        tx.cash_account_id ?? null,
+        tx.currency ?? 'SEK',
+      )
+      return {
+        id: newManualLineId(),
+        account_number: account,
+        debit_amount: isIncome ? Math.abs(tx.amount).toFixed(2).replace('.', ',') : '',
+        credit_amount: isIncome ? '' : Math.abs(tx.amount).toFixed(2).replace('.', ','),
+        line_description: (tx.description || '').slice(0, 40).trim(),
+      }
+    })
     // One empty counterpart row to scaffold the next entry. Account
-    // left blank — user must choose, which avoids the no-VAT trap.
+    // left blank: user must choose, which avoids the no-VAT trap.
     const counterpart: ManualLine = {
       id: newManualLineId(),
       account_number: '',
@@ -180,9 +242,9 @@ export default function BulkBookDialog({
       line_description: '',
     }
     setManualLines([...bankLines, counterpart])
-  }, [tab, manualLines.length, transactions, direction])
+  }, [tab, manualLines.length, transactions, direction, cashAccounts])
 
-  // Live line preview — driven by either the template/mode pair (template
+  // Live line preview: driven by either the template/mode pair (template
   // tab) or the user-edited manual lines (manual tab). Same downstream
   // invariants (balance + bank-leg match) apply to both paths.
   const previewLines = useMemo<PreviewLine[]>(() => {
@@ -225,7 +287,7 @@ export default function BulkBookDialog({
             debit_amount: round2(debit),
             credit_amount: round2(credit),
             line_description: tag
-              ? `${fl.line_description ?? ''} – ${tag}`.trim()
+              ? `${fl.line_description ?? ''}, ${tag}`.trim()
               : fl.line_description,
           })
         }
@@ -251,8 +313,8 @@ export default function BulkBookDialog({
 
   // The active tab gates which selector must be valid. Both paths still
   // need a non-empty description, ≥2 lines, balance, bank-leg match,
-  // and (for manual mode) valid 4-digit account numbers — without this,
-  // a 1–3-digit entry escapes the lexicographic bank-account range
+  // and (for manual mode) valid 4-digit account numbers: without this,
+  // a 1-3-digit entry escapes the lexicographic bank-account range
   // check ('193' < '1900' is true), bank match could pass, and the
   // server's Zod schema rejects with a 400 only after submit.
   const tabReady = tab === 'template' ? selectedTemplate !== null : manualLines.length > 0
@@ -265,6 +327,23 @@ export default function BulkBookDialog({
     isBalanced &&
     bankMatches &&
     allAccountsValid
+
+  function setDefaultDimension(dimNo: string, code: string | null) {
+    setDefaultDims((prev) => {
+      const next = { ...prev }
+      const trimmed = code?.trim()
+      if (trimmed) next[dimNo] = trimmed
+      else delete next[dimNo]
+      return next
+    })
+  }
+
+  // Compact display, e.g. "KS01 · P001" (dim-number order) for the preview badge.
+  const dimsSummary = Object.entries(defaultDims)
+    .filter(([, v]) => v)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .map(([, v]) => v)
+    .join(' · ')
 
   function updateManualLine(id: string, patch: Partial<Omit<ManualLine, 'id'>>) {
     setManualLines((prev) => prev.map((l) => (l.id === id ? { ...l, ...patch } : l)))
@@ -294,6 +373,12 @@ export default function BulkBookDialog({
       // Build the payload per the active tab. Template path uses the
       // existing schema branch (template_id + mode). Manual path sends
       // the user-edited lines directly.
+      // Header-level default dimensions ride as a top-level field on both
+      // branches; only sent when the user actually picked something.
+      const defaultDimensions =
+        dimensionsEnabled && Object.keys(defaultDims).length > 0
+          ? { default_dimensions: defaultDims }
+          : {}
       const payload =
         tab === 'manual'
           ? {
@@ -306,12 +391,14 @@ export default function BulkBookDialog({
                 currency: sharedCurrency,
                 line_description: l.line_description ?? undefined,
               })),
+              ...defaultDimensions,
             }
           : {
               tx_ids: transactions.map((tx) => tx.id),
               template_id: selectedTemplateId,
               mode,
               entry_description: description.trim(),
+              ...defaultDimensions,
             }
       const response = await fetch('/api/transactions/bulk-book', {
         method: 'POST',
@@ -425,9 +512,9 @@ export default function BulkBookDialog({
                             <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                             <span className="text-sm font-medium truncate">{tpl.name}</span>
                             {tpl.is_system && (
-                              <Badge variant="outline" className="text-[10px]">
+                              <span className="flex-shrink-0 text-[10px] text-muted-foreground">
                                 {t('system_badge')}
-                              </Badge>
+                              </span>
                             )}
                           </div>
                           {tpl.description && (
@@ -444,7 +531,7 @@ export default function BulkBookDialog({
             )}
           </div>
 
-          {/* Mode toggle — segmented control pattern (no RadioGroup primitive
+          {/* Mode toggle: segmented control pattern (no RadioGroup primitive
               in the design system; two outlined buttons act as a selectable
               pair) */}
           {selectedTemplate && (
@@ -574,7 +661,7 @@ export default function BulkBookDialog({
             </TabsContent>
           </Tabs>
 
-          {/* Description — shared by both tabs once the user has either a
+          {/* Description: shared by both tabs once the user has either a
               template selected or manual lines drafted. */}
           {tabReady && (
             <div className="space-y-2">
@@ -588,7 +675,20 @@ export default function BulkBookDialog({
             </div>
           )}
 
-          {/* Document inheritance hint — informs the user which receipts
+          {/* Header default dims (kostnadsställe/projekt): one bag applied to
+              the whole verifikat, shared by both tabs. */}
+          {dimensionsEnabled && tabReady && (
+            <div className="space-y-1">
+              <LineDimensionFields
+                dimensions={defaultDims}
+                onChange={setDefaultDimension}
+                inputClassName="h-8"
+              />
+              <p className="text-xs text-muted-foreground">{t('dimensions_hint')}</p>
+            </div>
+          )}
+
+          {/* Document inheritance hint: informs the user which receipts
               follow the txs onto the combined verifikat. Zero is fine
               (txs without docs don't break anything); we only render
               when the count is non-zero to avoid clutter. */}
@@ -602,9 +702,16 @@ export default function BulkBookDialog({
           {/* Live preview */}
           {tabReady && previewLines.length > 0 && (
             <div className="space-y-2">
-              <Label>
-                {t('preview_label', { count: previewLines.length })}
-              </Label>
+              <div className="flex items-center gap-2">
+                <Label>
+                  {t('preview_label', { count: previewLines.length })}
+                </Label>
+                {dimensionsEnabled && dimsSummary && (
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {dimsSummary}
+                  </Badge>
+                )}
+              </div>
               <div className="rounded-lg border bg-muted/30 overflow-hidden">
                 <table className="w-full text-xs tabular-nums">
                   <thead>
@@ -620,7 +727,7 @@ export default function BulkBookDialog({
                       <tr key={i} className="border-b border-border/40 last:border-b-0">
                         <td className="px-3 py-1.5 font-mono">{line.account_number}</td>
                         <td className="px-3 py-1.5 text-muted-foreground truncate max-w-[240px]">
-                          {line.line_description ?? '—'}
+                          {line.line_description ?? '-'}
                         </td>
                         <td className="px-3 py-1.5 text-right">
                           {line.debit_amount > 0 ? formatCurrency(line.debit_amount) : ''}

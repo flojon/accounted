@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // ============================================================
-// Mock — sequential result queue (mirrors vat-declaration.test.ts)
+// Mock: sequential result queue (mirrors vat-declaration.test.ts)
 // ============================================================
 
 let resultIdx: number
@@ -9,7 +9,7 @@ let results: Array<{ data?: unknown; error?: unknown }>
 
 function makeBuilder() {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'lt', 'or', 'not', 'range']) {
+  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'lt', 'or', 'not', 'order', 'range']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
   b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
@@ -404,7 +404,7 @@ describe('generatePeriodiskSammanstallning', () => {
 describe('reconcilePsAgainstVatDeclaration', () => {
   it('returns null matches when periods do not coincide', async () => {
     const report = await generatePeriodiskSammanstallning(supabase, 'c1', 'quarterly', 2025, 2)
-    // No data calls expected — function bails before invoking calculateVatDeclaration.
+    // No data calls expected: function bails before invoking calculateVatDeclaration.
     results = []
     const reconciled = await reconcilePsAgainstVatDeclaration(supabase, 'c1', report, 'monthly')
     expect(reconciled.reconciliation.matches).toBeNull()

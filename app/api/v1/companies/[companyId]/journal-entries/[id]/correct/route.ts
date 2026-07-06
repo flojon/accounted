@@ -6,7 +6,7 @@
  * posted with the new lines. All three remain in the verifikationsserie,
  * linked via reverses_id, reversed_by_id, and correction_of_id.
  *
- * Body: `{ lines: [...] }` — the new balanced lines. The corrected entry
+ * Body: `{ lines: [...] }`: the new balanced lines. The corrected entry
  * inherits entry_date, fiscal_period_id, description, and voucher_series
  * from the original.
  *
@@ -16,7 +16,7 @@
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
@@ -42,9 +42,9 @@ registerEndpoint({
   description:
     'Per Bokföringslagen 5 kap 5 §, posted entries cannot be modified. This endpoint creates the canonical correction trail: a storno reversing the original, then a new entry with the corrected lines. All three are visible in the verifikationsserie and linked via reverses_id / reversed_by_id / correction_of_id. Idempotent. Dry-runnable.',
   useWhen:
-    'You need to amend a posted verifikation. Use this rather than /reverse when the entry is being REPLACED with new lines — /reverse just nullifies.',
+    'You need to amend a posted verifikation. Use this rather than /reverse when the entry is being REPLACED with new lines: /reverse just nullifies.',
   doNotUseFor:
-    'Drafts (no voucher_number — cancel via dashboard). Already-corrected entries (the chain only supports one correction; correct the latest in the chain).',
+    'Drafts (no voucher_number: cancel via dashboard). Already-corrected entries (the chain only supports one correction; correct the latest in the chain).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
     'The new lines must balance. JOURNAL_ENTRY_NOT_BALANCED if not.',
@@ -76,7 +76,7 @@ registerEndpoint({
   reversible: false,
   dryRunSupported: true,
   request: { body: CorrectJournalEntrySchema },
-  response: { success: JournalEntryCorrected },
+  response: { success: dataEnvelope(JournalEntryCorrected) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(

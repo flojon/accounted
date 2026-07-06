@@ -81,6 +81,7 @@ function enqueueHappyPath(opts: {
     exchange_rate?: number | null
     remaining_amount?: number
     paid_amount?: number
+    status?: string
   }
   accountingMethod?: string
 }) {
@@ -103,7 +104,7 @@ function enqueueHappyPath(opts: {
       id: SI_UUID,
       currency: opts.invoice.currency,
       exchange_rate: opts.invoice.exchange_rate ?? null,
-      status: 'registered',
+      status: opts.invoice.status ?? 'registered',
       remaining_amount: opts.invoice.remaining_amount ?? 225,
       paid_amount: opts.invoice.paid_amount ?? 0,
       supplier: { supplier_type: 'eu_business' },
@@ -121,11 +122,11 @@ function enqueueHappyPath(opts: {
   enqueue({ data: null, error: null })
 }
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — FX residual', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: FX residual', () => {
   it('books a clean SEK clearing entry (no FX) for a SEK tx paying a SEK invoice', async () => {
     // SEK/SEK now routes through buildSupplierPaymentClearingLines +
     // createJournalEntry, not createSupplierInvoicePaymentEntry. An exact
-    // payment yields just Dr 2440 / Cr 1930 — no 3960/7960 FX line, no 3740.
+    // payment yields just Dr 2440 / Cr 1930: no 3960/7960 FX line, no 3740.
     enqueueHappyPath({
       transaction: { amount: -2390, currency: 'SEK' },
       invoice: { currency: 'SEK', remaining_amount: 2390 },
@@ -201,7 +202,7 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — FX residual', (
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — non-FX paths', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: non-FX paths', () => {
   it('returns 200 with the expected body shape on the happy path', async () => {
     enqueueHappyPath({
       transaction: { amount: -1000, currency: 'SEK' },
@@ -285,6 +286,18 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — non-FX paths', 
     expect(details.excess).toBe(1000)
   })
 
+  it('succeeds for an overdue invoice (status is a valid CAS target)', async () => {
+    // Regression: CAS guard previously omitted 'overdue', so selecting an overdue
+    // invoice from SupplierInvoicePicker would commit a JE, fail the update, orphan
+    // the voucher, and return MATCH_SI_NOT_OPEN.
+    enqueueHappyPath({
+      transaction: { amount: -1000, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 1000, status: 'overdue' },
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+  })
+
   it('does NOT trigger overshoot guard on currency mismatch (FX path clamps to remaining)', async () => {
     // SEK transaction paying a EUR invoice. The currency-mismatch branch
     // collapses paymentAmountInvoiceCurrency to invoice.remaining_amount and
@@ -298,11 +311,11 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — non-FX paths', 
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + FX', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: cash method + FX', () => {
   it('full cross-currency settlement books at the payment rate (no FX-unsupported error)', async () => {
     // Cash method, SEK account paying a 25 USD invoice. The invoice's stored
     // rate (9.20 → 230 SEK) differs from the 239 SEK that actually left the
-    // bank — previously this was blocked. It must now succeed and hand the
+    // bank: previously this was blocked. It must now succeed and hand the
     // cash builder the real bank SEK so 1930 matches the bank line.
     enqueueHappyPath({
       transaction: { amount: -239, currency: 'SEK' },
@@ -344,13 +357,13 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
     const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
     expect(res.status).toBe(200)
     expect(mockCreateCashEntry).toHaveBeenCalledTimes(1)
-    // No bogus settledBankSek=19 override — the builder uses the invoice rate.
+    // No bogus settledBankSek=19 override: the builder uses the invoice rate.
     expect(mockCreateCashEntry.mock.calls[0][9]).toBeUndefined()
   })
 
   it('PARTIAL foreign payment under the cash method is still rejected', async () => {
     // Paying only 10 of 19 USD remaining. The cash builder books the whole
-    // invoice, so a partial bank amount cannot pin the entry — still blocked.
+    // invoice, so a partial bank amount cannot pin the entry: still blocked.
     enqueueHappyPath({
       transaction: { amount: -10, currency: 'USD', amount_sek: -92.25 },
       invoice: { currency: 'USD', exchange_rate: 9.20, remaining_amount: 19 },
@@ -363,7 +376,7 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
     expect(mockCreateCashEntry).not.toHaveBeenCalled()
   })
 
-  it('does NOT absorb öre under the cash method — a SEK sub-krona diff stays partial', async () => {
+  it('does NOT absorb öre under the cash method: a SEK sub-krona diff stays partial', async () => {
     // Kontantmetoden books the full invoice via the cash entry (not the bank
     // amount), so folding the 0,25 to 3740 would hide a 1930 discrepancy. The
     // öre band is accrual-only; here the invoice stays partially_paid.
@@ -385,14 +398,13 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — payment JE failure aborts', () => {
-  // Regression: the route used to catch a JE-creation failure and proceed —
-  // marking the invoice paid with NO payment voucher. That half-state is
+describe('POST /api/transactions/[id]/match-supplier-invoice: payment JE failure aborts', () => {
+  // Regression: the route used to catch a JE-creation failure and proceed:   // marking the invoice paid with NO payment voucher. That half-state is
   // unrecoverable (mark-paid rejects 'paid', match rejects linked txs), so a
   // failed voucher must now fail the whole match before any state mutation.
 
   it('returns 500 MATCH_SI_JE_FAILED and mutates nothing when the engine throws (pure-SEK path)', async () => {
-    // Only the 3 reads enqueued — if the route (incorrectly) proceeded to the
+    // Only the 3 reads enqueued: if the route (incorrectly) proceeded to the
     // invoice update, the empty queue would surface as MATCH_SI_NOT_OPEN.
     enqueueHappyPath({
       transaction: { amount: -29890, currency: 'SEK' },

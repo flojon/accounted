@@ -2,7 +2,7 @@
  * POST /api/v1/companies/{companyId}/fiscal-periods/{id}/opening-balances
  *
  * Generates the opening-balance verifikation for the next period from the
- * closed period's trial balance (BAS class 1–2 accounts with non-zero
+ * closed period's trial balance (BAS class 1-2 accounts with non-zero
  * closing balance). Wraps lib/core/bookkeeping/year-end-service.generateOpeningBalances.
  * Synchronous.
  *
@@ -12,7 +12,7 @@
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { ownsFiscalPeriod } from '@/lib/api/v1/owns-fiscal-period'
@@ -33,7 +33,7 @@ registerEndpoint({
   path: '/api/v1/companies/:companyId/fiscal-periods/:id/opening-balances',
   summary: 'Generate opening-balance verifikation for the next fiscal period.',
   description:
-    'Reads the closed period\'s trial balance, filters to BAS class 1–2 accounts with non-zero closing balance, and posts an opening verifikation (status=posted) onto the next_period_id. Sync. The path id is the CLOSED period; body.next_period_id is the target.',
+    'Reads the closed period\'s trial balance, filters to BAS class 1-2 accounts with non-zero closing balance, and posts an opening verifikation (status=posted) onto the next_period_id. Sync. The path id is the CLOSED period; body.next_period_id is the target.',
   useWhen:
     'After /year-end + /close on a period, generate the IB into the next period so the new year starts with the correct balance sheet.',
   doNotUseFor:
@@ -56,7 +56,7 @@ registerEndpoint({
   reversible: true,
   dryRunSupported: false,
   request: { body: Body },
-  response: { success: OpeningBalancesResponse },
+  response: { success: dataEnvelope(OpeningBalancesResponse) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(

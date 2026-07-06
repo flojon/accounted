@@ -3,6 +3,7 @@
 import { useTranslations } from 'next-intl'
 import { BankDetailsForm, validateBankFields } from '@/components/settings/BankDetailsForm'
 import { InvoiceSettingsForm } from '@/components/settings/InvoiceSettingsForm'
+import { InvoiceEmailTextsSettings } from '@/components/settings/InvoiceEmailTextsSettings'
 import { InvoicePreviewCard } from '@/components/settings/InvoicePreviewCard'
 import { PdfPrintSettings } from '@/components/settings/PdfPrintSettings'
 import { SettingsFormWrapper } from '@/components/settings/SettingsFormWrapper'
@@ -11,6 +12,7 @@ import { SettingsLoadingSkeleton } from '@/components/settings/SettingsLoadingSk
 import { useSettings } from '@/components/settings/useSettings'
 import { useToast } from '@/components/ui/use-toast'
 import { normaliseSwish } from '@/lib/payments/swish'
+import { formatPlusgiroNumber } from '@/lib/bankgiro/luhn'
 import type { CompanySettings } from '@/types'
 
 export function InvoicingSettingsContent() {
@@ -37,6 +39,9 @@ export function InvoicingSettingsContent() {
       clearing_number: formData.get('clearing_number') as string,
       account_number: formData.get('account_number') as string,
       bankgiro: (formData.get('bankgiro') as string) || null,
+      plusgiro: (formData.get('plusgiro') as string)?.trim()
+        ? formatPlusgiroNumber((formData.get('plusgiro') as string).trim())
+        : null,
       swish: normaliseSwish(formData.get('swish') as string) || null,
       invoice_prefix: (formData.get('invoice_prefix') as string) || null,
       next_invoice_number: parseInt(formData.get('next_invoice_number') as string) || 1,
@@ -65,9 +70,14 @@ export function InvoicingSettingsContent() {
         </div>
       </SettingsFormWrapper>
 
-      {/* PDF settings — saves individually via toggle switches */}
+      {/* PDF settings: saves individually via toggle switches */}
       <div className="border-t border-border pt-8">
         <PdfPrintSettings settings={settings} onUpdate={updateSettings} />
+      </div>
+
+      {/* Invoice email texts: autosaves on blur */}
+      <div className="border-t border-border pt-8">
+        <InvoiceEmailTextsSettings settings={settings} onUpdate={updateSettings} />
       </div>
     </div>
   )

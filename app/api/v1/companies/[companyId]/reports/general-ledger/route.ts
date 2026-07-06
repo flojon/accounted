@@ -8,7 +8,7 @@
 
 import { z } from 'zod'
 import { ok } from '@/lib/api/v1/response'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { loadPeriodFromQuery, safeGenerate } from '@/lib/api/v1/report-period'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
@@ -24,7 +24,7 @@ registerEndpoint({
   description:
     'Returns every posted journal line in the period grouped by account, with opening / running / closing balances. Supports optional `account_from` and `account_to` query parameters to limit the report to an account range (e.g. ?account_from=3000&account_to=3999 for revenue-only).',
   useWhen:
-    'You\'re reconciling a specific account or range — bank account drilldown, revenue audit, expense investigation — and need every voucher-line that hit the account.',
+    'You\'re reconciling a specific account or range (bank account drilldown, revenue audit, expense investigation) and need every voucher-line that hit the account.',
   doNotUseFor:
     'Period totals only (use /reports/trial-balance). Specific transaction lookup (use /journal-entries/{id}).',
   pitfalls: [
@@ -43,7 +43,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
-  response: { success: GeneralLedgerResponse },
+  response: { success: dataEnvelope(GeneralLedgerResponse) },
 })
 
 export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
@@ -54,8 +54,8 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     const accountTo = url.searchParams.get('account_to') || undefined
 
     // BAS account numbers are 4 digits today but extensible to 5 / 6 in
-    // sub-account schemes (kostställen). Pattern allows 3–8 to leave room
-    // without accepting arbitrary strings. OWASP V2.2 — bound the values
+    // sub-account schemes (kostställen). Pattern allows 3-8 to leave room
+    // without accepting arbitrary strings. OWASP V2.2: bound the values
     // before they reach the report generator's downstream queries.
     const accountRe = /^\d{3,8}$/
     if (accountFrom && !accountRe.test(accountFrom)) {

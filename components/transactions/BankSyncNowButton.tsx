@@ -14,7 +14,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { createClient } from '@/lib/supabase/client'
-import { useCompany } from '@/contexts/CompanyContext'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 
 interface BankConn {
   id: string
@@ -38,6 +39,7 @@ export default function BankSyncNowButton() {
   const { toast } = useToast()
   const router = useRouter()
   const { company } = useCompany()
+  const hasBankSync = useCapability(CAPABILITY.bank_sync)
   const [connections, setConnections] = useState<BankConn[] | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
 
@@ -48,7 +50,7 @@ export default function BankSyncNowButton() {
     supabase
       .from('bank_connections')
       .select('id, bank_name, status, provider')
-      // Include expired/error so the reconnect entry point survives a reload —
+      // Include expired/error so the reconnect entry point survives a reload:
       // not just active connections that can sync.
       .in('status', ['active', 'expired', 'error'])
       .eq('company_id', company.id)
@@ -62,7 +64,7 @@ export default function BankSyncNowButton() {
 
   if (!connections || connections.length === 0) return null
 
-  // Re-authorize an existing connection in place — posts the connection_id so
+  // Re-authorize an existing connection in place: posts the connection_id so
   // the server reuses the same row, then hands off to the bank's consent screen.
   async function reconnect(conn: BankConn) {
     setBusyId(conn.id)
@@ -100,7 +102,7 @@ export default function BankSyncNowButton() {
       })
       const data = await res.json()
       if (!res.ok) {
-        // A dead PSD2 session can't be fixed by retrying — surface a one-click
+        // A dead PSD2 session can't be fixed by retrying: surface a one-click
         // reconnect in the toast instead of a dead-end error.
         if (data?.reauth_required) {
           toast({
@@ -148,35 +150,54 @@ export default function BankSyncNowButton() {
   const isBusy = busyId !== null
   const syncLabel = isBusy ? t('bank_sync_button_syncing') : t('bank_sync_button_now')
 
+  // Bank sync (and reconnect) is a paid external PSD2 call. Without the
+  // capability we keep the button VISIBLE as the conversion surface but inert,
+  // and surface an Uppgradera link. CSV/SIE import stays free (separate UI).
+  const gateTitle = !hasBankSync ? 'Bankkoppling kräver ett abonnemang' : undefined
+  const upsellNote = !hasBankSync ? (
+    <span className="text-xs text-muted-foreground">
+      Kräver abonnemang.{' '}
+      <a href="/settings/billing" className="underline underline-offset-2">
+        Uppgradera
+      </a>
+    </span>
+  ) : null
+
   if (connections.length === 1) {
     const conn = connections[0]
     const needsReconnect = conn.status !== 'active'
     return (
-      <Button
-        variant="outline"
-        size="sm"
-        className="h-7 gap-1.5 px-2.5 text-xs"
-        disabled={isBusy}
-        onClick={() => runFor(conn)}
-      >
-        {isBusy ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-        ) : (
-          <RefreshCw className="h-3.5 w-3.5" />
-        )}
-        <span>{needsReconnect ? t('bank_reconnect') : syncLabel}</span>
-      </Button>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1.5 px-2.5 text-xs"
+          disabled={isBusy || !hasBankSync}
+          title={gateTitle}
+          onClick={() => runFor(conn)}
+        >
+          {isBusy ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" />
+          )}
+          <span>{needsReconnect ? t('bank_reconnect') : syncLabel}</span>
+        </Button>
+        {upsellNote}
+      </div>
     )
   }
 
   return (
+    <div className="flex items-center gap-2">
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
           size="sm"
           className="h-7 gap-1.5 px-2.5 text-xs"
-          disabled={isBusy}
+          disabled={isBusy || !hasBankSync}
+          title={gateTitle}
         >
           {isBusy ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -200,5 +221,7 @@ export default function BankSyncNowButton() {
         ))}
       </DropdownMenuContent>
     </DropdownMenu>
+    {upsellNote}
+    </div>
   )
 }

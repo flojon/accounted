@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // ============================================================
-// Mock Supabase — table-keyed result queues
+// Mock Supabase: table-keyed result queues
 // ============================================================
 
 type MockResult = { data?: unknown; error?: unknown; count?: number }
@@ -9,7 +9,7 @@ let mockResults: Record<string, MockResult[]>
 
 function makeBuilder(tableName: string) {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'lt', 'neq', 'range', 'update']) {
+  for (const m of ['select', 'eq', 'in', 'lt', 'neq', 'order', 'range', 'update']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
   const consume = (): MockResult => {
@@ -72,7 +72,7 @@ describe('validateBalanceContinuity', () => {
         { data: { period_start: '2024-01-01', opening_balance_entry_id: null } },
       ],
       journal_entry_lines: [
-        // Previous period lines (trial balance — prior OB comes from RPC, defaults empty)
+        // Previous period lines (trial balance: prior OB comes from RPC, defaults empty)
         {
           data: [
             { account_number: '1930', debit_amount: 50000, credit_amount: 0 },

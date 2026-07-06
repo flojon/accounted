@@ -22,6 +22,7 @@ import { useToast } from '@/components/ui/use-toast'
 import { ArrowUpRight, ArrowDownRight, Loader2 } from 'lucide-react'
 import type { TransactionWithInvoice } from './transaction-types'
 import type { CashAccount } from '@/types'
+import { resolveAccount } from '@/lib/cash-accounts/resolve-account'
 
 interface MatchVoucherDialogProps {
   open: boolean
@@ -31,7 +32,7 @@ interface MatchVoucherDialogProps {
   onLinked: (transactionId: string, journalEntryId: string, voucherLabel: string) => void
 }
 
-// ±30 days around the transaction date — wide enough to catch a salary or
+// ±30 days around the transaction date: wide enough to catch a salary or
 // supplier voucher booked a few days off the bank value date, narrow enough to
 // keep the candidate list short. "Visa alla" drops the window entirely.
 const WINDOW_DAYS = 30
@@ -41,23 +42,6 @@ function shiftDate(isoDate: string, deltaDays: number): string {
   if (Number.isNaN(d.getTime())) return isoDate
   d.setDate(d.getDate() + deltaDays)
   return d.toISOString().slice(0, 10)
-}
-
-/** Resolve which cash account (BAS ledger number) this transaction reconciles against. */
-function resolveAccount(
-  cashAccounts: CashAccount[],
-  tx: TransactionWithInvoice,
-): { account: string; fallback: boolean } {
-  // 1. Bound row → its own account.
-  if (tx.cash_account_id) {
-    const bound = cashAccounts.find((a) => a.id === tx.cash_account_id)
-    if (bound) return { account: bound.ledger_account, fallback: false }
-  }
-  // 2. Legacy NULL → the sole enabled account of the transaction's currency.
-  const sameCurrency = cashAccounts.filter((a) => a.enabled && a.currency === tx.currency)
-  if (sameCurrency.length === 1) return { account: sameCurrency[0].ledger_account, fallback: false }
-  // 3. Give up gracefully on 1930 (the default SEK företagskonto).
-  return { account: '1930', fallback: true }
 }
 
 export function MatchVoucherDialog({
@@ -75,12 +59,12 @@ export function MatchVoucherDialog({
   const [submitting, setSubmitting] = useState(false)
   const [wideRange, setWideRange] = useState(false)
   // Opt-in: also surface vouchers already matched to another bank transaction,
-  // so several transactions can settle one verifikat (N:1 — a salary run paid in
+  // so several transactions can settle one verifikat (N:1: a salary run paid in
   // multiple transfers, an invoice paid in instalments).
   const [includeMatched, setIncludeMatched] = useState(false)
 
   const loadCandidates = useCallback(
-    async (tx: TransactionWithInvoice, wide: boolean, matched: boolean) => {
+    async (tx: TransactionWithInvoice, wide: boolean, matched: boolean, signal: { cancelled: boolean }) => {
       setLoading(true)
       try {
         // Resolve the settlement account from the company's cash accounts.
@@ -88,16 +72,22 @@ export function MatchVoucherDialog({
         let fallback = true
         try {
           const caRes = await fetch('/api/cash-accounts')
-          const caJson = await caRes.json()
-          const accounts = (caJson.data ?? []) as CashAccount[]
-          const resolved = resolveAccount(accounts, tx)
-          account = resolved.account
-          fallback = resolved.fallback
+          if (caRes.ok) {
+            const caJson = await caRes.json()
+            if (!signal.cancelled) {
+              const accounts = (caJson.data ?? []) as CashAccount[]
+              const resolved = resolveAccount(accounts, tx.cash_account_id ?? null, tx.currency ?? 'SEK')
+              account = resolved.account
+              fallback = resolved.fallback
+            }
+          }
         } catch {
-          // Network hiccup — fall back to 1930 and let the user see the note.
+          // Network hiccup: fall back to 1930 and let the user see the note.
         }
-        setAccountNumber(account)
-        setAccountFallback(fallback)
+        if (!signal.cancelled) {
+          setAccountNumber(account)
+          setAccountFallback(fallback)
+        }
 
         const params = new URLSearchParams()
         params.set('account_number', account)
@@ -110,14 +100,15 @@ export function MatchVoucherDialog({
 
         const res = await fetch(`/api/reconciliation/bank/unmatched-entries?${params}`)
         const json = await res.json()
+        if (signal.cancelled) return
         const lines = (json.data ?? []) as UnlinkedGLLine[]
         setGlLines(lines)
         // Pre-select a strong auto-match (exact/reference/date-range) so the
         // common case is one click. Fuzzy (<0.85) is left for the user to confirm.
         // Auto-select a strong match only when nothing is chosen yet. Toggling
-        // "Visa alla datum" reloads with a wider set — it must NOT discard a
+        // "Visa alla datum" reloads with a wider set: it must NOT discard a
         // voucher the user already picked. (selected resets to '' on close.)
-        // Never auto-select an already-matched voucher — N:1 must be a
+        // Never auto-select an already-matched voucher: N:1 must be a
         // deliberate choice, not the default when "visa matchade" is on.
         const top = lines[0]
         setSelected((prev) =>
@@ -128,7 +119,7 @@ export function MatchVoucherDialog({
               : '',
         )
       } finally {
-        setLoading(false)
+        if (!signal.cancelled) setLoading(false)
       }
     },
     [],
@@ -138,7 +129,9 @@ export function MatchVoucherDialog({
   // the user toggles already-matched vouchers in/out.
   useEffect(() => {
     if (!open || !transaction) return
-    void loadCandidates(transaction, wideRange, includeMatched)
+    const signal = { cancelled: false }
+    void loadCandidates(transaction, wideRange, includeMatched, signal)
+    return () => { signal.cancelled = true }
   }, [open, transaction, wideRange, includeMatched, loadCandidates])
 
   // Reset transient state when the dialog closes so the next open starts clean.
@@ -249,14 +242,14 @@ export function MatchVoucherDialog({
                 <p className="text-xs text-muted-foreground">
                   Verifikationen är redan matchad mot {selectedLine?.linked_transaction_count}{' '}
                   transaktion{(selectedLine?.linked_transaction_count ?? 0) === 1 ? '' : 'er'}.
-                  Kopplingen lägger till den här transaktionen också — t.ex. en lön utbetald i
+                  Kopplingen lägger till den här transaktionen också: t.ex. en lön utbetald i
                   flera överföringar.
                 </p>
               )}
             </>
           )}
 
-          {/* Discovery affordances — widen the date window, and surface vouchers
+          {/* Discovery affordances: widen the date window, and surface vouchers
               already matched so another transaction can be attached (N:1). */}
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 pt-1">
             <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">

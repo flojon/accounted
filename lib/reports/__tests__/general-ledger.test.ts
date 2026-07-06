@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // ============================================================
-// Mock — table-keyed result queues
+// Mock: table-keyed result queues
 // ============================================================
 
 type MockResult = { data?: unknown; error?: unknown }
@@ -62,7 +62,7 @@ describe('generateGeneralLedger', () => {
         { data: { period_start: '2024-01-01', period_end: '2024-12-31', opening_balance_entry_id: null }, error: null },
       ],
       journal_entry_lines: [
-        // period lines — empty (prior lines come from RPC, defaults to empty)
+        // period lines: empty (prior lines come from RPC, defaults to empty)
         { data: [], error: null },
       ],
     }
@@ -122,6 +122,54 @@ describe('generateGeneralLedger', () => {
     expect(acc1930.total_debit).toBe(1250)
     expect(acc1930.total_credit).toBe(0)
     expect(acc1930.closing_balance).toBe(1250)
+  })
+
+  it('does not double a balance when an unstable page boundary re-serves a line (#790/#791)', async () => {
+    // Reproduces the doubling bug's mechanism: a paginated query whose order
+    // was not stable can return the same journal_entry_line on two pages.
+    // Page 1 must be a FULL page (PAGE_SIZE rows) so fetchAllRows fetches a
+    // second page; page 2 re-serves the 5010 line. dedupeBy(line id) must
+    // collapse it so the single 4000 posting totals 4000, not 8000.
+    const PAGE_SIZE = 1000
+    const filler = Array.from({ length: PAGE_SIZE - 1 }, (_, i) => ({
+      id: `f${i}`,
+      account_number: '1930',
+      debit_amount: 0,
+      credit_amount: 0,
+      journal_entries: { entry_date: '2024-01-02', voucher_number: 1, voucher_series: 'A', description: 'filler', source_type: 'manual' },
+    }))
+    const rentLine = {
+      id: 'rent-line-1',
+      account_number: '5010',
+      debit_amount: 4000,
+      credit_amount: 0,
+      journal_entries: { entry_date: '2024-01-15', voucher_number: 2, voucher_series: 'A', description: 'Lokalhyra', source_type: 'manual' },
+    }
+
+    mockResults = {
+      fiscal_periods: [
+        { data: { period_start: '2024-01-01', period_end: '2024-12-31', opening_balance_entry_id: null }, error: null },
+      ],
+      journal_entry_lines: [
+        { data: [...filler, rentLine], error: null }, // page 1: full → triggers page 2
+        { data: [rentLine], error: null },            // page 2: duplicate of the 5010 line
+      ],
+      chart_of_accounts: [
+        {
+          data: [
+            { account_number: '1930', account_name: 'Företagskonto' },
+            { account_number: '5010', account_name: 'Lokalhyra' },
+          ],
+          error: null,
+        },
+      ],
+    }
+
+    const report = await generateGeneralLedger(supabase, 'company-1', 'period-1')
+
+    const acc5010 = report.accounts.find((a) => a.account_number === '5010')!
+    expect(acc5010.total_debit).toBe(4000) // not 8000
+    expect(acc5010.lines).toHaveLength(1) // verifikat listed once, not twice
   })
 
   it('computes opening balance from prior period entries', async () => {
@@ -187,7 +235,7 @@ describe('generateGeneralLedger', () => {
 
     const report = await generateGeneralLedger(supabase, 'company-1', 'period-1', '1500', '1999')
 
-    // Only accounts in 1500–1999 range
+    // Only accounts in 1500-1999 range
     expect(report.accounts.map((a) => a.account_number)).toEqual(['1510', '1930'])
   })
 
@@ -197,7 +245,7 @@ describe('generateGeneralLedger', () => {
         { data: { period_start: '2024-01-01', period_end: '2024-12-31', opening_balance_entry_id: null }, error: null },
       ],
       journal_entry_lines: [
-        // period lines — out of order
+        // period lines: out of order
         {
           data: [
             { account_number: '1930', debit_amount: 100, credit_amount: 0, journal_entries: { entry_date: '2024-01-10', voucher_number: 2, voucher_series: 'A', description: 'Second', source_type: 'manual' } },
